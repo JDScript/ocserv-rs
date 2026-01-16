@@ -1,15 +1,9 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<config-auth client="vpn" type="complete" {% if aggregate_auth_version %}aggregate-auth-version="{{ aggregate_auth_version }}"{% endif %}>
-    <session-id>{{ session_id }}</session-id>
-    <session-token>{{ session_token }}</session-token>
+<config-auth client="vpn" type="complete">
+    <version who="sg">0.1(1)</version>
     <auth id="success">
-        <message id="0" param1="" param2=""></message>
+        <title>SSL VPN Service</title>
+        <banner>{{ banner }}</banner>
     </auth>
-    <config client="vpn" type="private">
-        <vpn-base-config>
-            {% if optional_modules %}<optional-modules>{{ optional_modules }}</optional-modules>{% endif %}
-            {% if base_package_uri %}<base-package-uri>{{ base_package_uri }}</base-package-uri>{% endif %}
-            {% if server_cert_hash %}<server-cert-hash>{{ server_cert_hash }}</server-cert-hash>{% endif %}
-        </vpn-base-config>
-    </config>
 </config-auth>
+
+

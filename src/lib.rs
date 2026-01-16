@@ -3,6 +3,7 @@ pub mod config;
 pub mod http;
 pub mod protocol;
 pub mod tls_config;
+pub mod vpn;
 
 // Re-export commonly used items
 pub use config::Config;

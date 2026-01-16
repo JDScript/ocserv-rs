@@ -7,6 +7,9 @@ use std::path::Path;
 pub struct Config {
     pub server: ServerConfig,
     pub auth: AuthConfig,
+    /// Network Configuration (Phase 5)
+    #[serde(default)]
+    pub network: NetworkConfig,
 }
 
 /// Server configuration
@@ -75,6 +78,49 @@ pub struct SamlAuthConfig {
     pub dev_idp_enabled: bool,
 }
 
+/// Network Configuration (Phase 5)
+#[derive(Debug, Deserialize, Clone)]
+pub struct NetworkConfig {
+    /// IPv4 Address Pool (CIDR)
+    #[serde(default = "default_ipv4_pool")]
+    pub ipv4_pool: String,
+    /// IPv6 Address Pool (CIDR)
+    pub ipv6_pool: Option<String>,
+    /// DNS Servers
+    #[serde(default = "default_dns_servers")]
+    pub dns_servers: Vec<String>,
+    /// Split Tunnel Routes
+    #[serde(default)]
+    pub split_include: Vec<String>,
+    /// MTU
+    #[serde(default = "default_mtu")]
+    pub mtu: u16,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            ipv4_pool: default_ipv4_pool(),
+            ipv6_pool: None,
+            dns_servers: default_dns_servers(),
+            split_include: Vec::new(),
+            mtu: default_mtu(),
+        }
+    }
+}
+
+fn default_ipv4_pool() -> String {
+    "10.10.0.0/24".to_string()
+}
+
+fn default_dns_servers() -> Vec<String> {
+    vec!["8.8.8.8".to_string(), "8.8.4.4".to_string()]
+}
+
+fn default_mtu() -> u16 {
+    1280
+}
+
 impl Config {
     /// Load configuration from TOML file
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
@@ -109,6 +155,7 @@ impl Config {
                 },
                 saml: SamlAuthConfig::default(),
             },
+            network: NetworkConfig::default(),
         }
     }
 }

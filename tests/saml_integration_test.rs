@@ -30,8 +30,10 @@ fn create_test_state() -> Arc<ServerState> {
                 dev_idp_enabled: true,
             },
         },
+        network: ocserv_rs::config::NetworkConfig::default(),
     };
-    Arc::new(ServerState::new(Arc::new(config)))
+    let dummy_hash = "0000000000000000000000000000000000000000".to_string();
+    Arc::new(ServerState::new(Arc::new(config), dummy_hash))
 }
 
 #[tokio::test]

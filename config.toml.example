@@ -49,3 +49,20 @@ enabled = false
 # base_url = "https://vpn.example.com"
 # sp_cert_path = "sp.crt"
 # sp_key_path = "sp.key"
+
+## Network Configuration (Phase 5)
+[network]
+# CIDR for client IP assignment
+ipv4_pool = "10.10.0.0/24"
+# ipv6_pool = "fd00::/64"
+
+# DNS servers pushed to client
+dns_servers = ["8.8.8.8", "8.8.4.4"]
+
+# Split Tunneling: List of subnets to route through VPN
+# Leave empty for Full Tunnel (Default Gateway)
+# split_include = ["192.168.1.0/24", "10.0.0.0/8"]
+split_include = []
+
+# Tunnel MTU
+mtu = 1280

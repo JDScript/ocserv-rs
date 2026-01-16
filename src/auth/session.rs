@@ -48,6 +48,15 @@ impl SessionManager {
         self.sessions.lock().unwrap().get(session_id).cloned()
     }
 
+    /// Get session by full session token (AnyConnect cookie format)
+    pub fn get_session_by_token(&self, token: &str) -> Option<VpnSession> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions
+            .values()
+            .find(|s| s.session_token == token)
+            .cloned()
+    }
+
     /// Remove session
     pub fn remove_session(&self, session_id: &str) {
         self.sessions.lock().unwrap().remove(session_id);

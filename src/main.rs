@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ocserv_rs::{create_tls_acceptor, load_tls_config, Config, HttpServer};
+use sha1::Digest;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,7 +57,26 @@ async fn main() -> Result<()> {
         .parse()
         .context("Invalid listen address in config")?;
 
-    let server = HttpServer::new(addr, tls_acceptor, config);
+    // Calculate certificate hash for AnyConnect compatibility (webvpnc cookie)
+    let cert_bytes = std::fs::read(&config.server.cert_path)
+        .context("Failed to read certificate for hash calculation")?;
+
+    // Parse PEM to find the first certificate (DER)
+    // ocserv uses the hash of the DER encoded certificate
+    let certs = rustls_pemfile::certs(&mut &*cert_bytes)
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to parse certificate PEM")?;
+
+    let first_cert = certs.first().context("No certificate found in file")?;
+
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(first_cert.as_ref());
+    let hash = hasher.finalize();
+    let cert_hash = hex::encode(hash);
+
+    info!("Calculated certificate SHA1 hash: {}", cert_hash);
+
+    let server = HttpServer::new(addr, tls_acceptor, config, cert_hash);
 
     info!("Server ready - HTTP/XML layer active on {}", addr);
     server.run().await?;

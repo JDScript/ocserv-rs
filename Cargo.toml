@@ -15,10 +15,9 @@ tokio-rustls = "0.25"
 rustls-pemfile = "2.0"
 webpki-roots = "0.26"
 
-# HTTP handling
-hyper = { version = "1.1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["full"] }
-http-body-util = "0.1"
+# HTTP handling (manual parsing, no hyper)
+httparse = "1.8"
+http = "1.0"
 
 # XML parsing with template support
 quick-xml = { version = "0.31", features = ["serialize"] }
@@ -45,6 +44,8 @@ base64 = "0.21"
 uuid = { version = "1.6", features = ["v4"] }
 cookie = "0.18"
 url = "2.5"
+sha1 = "0.10"
+hex = "0.4"
 
 # Configuration
 toml = "0.8"
