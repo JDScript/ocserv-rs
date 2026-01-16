@@ -97,9 +97,19 @@ impl HttpServer {
                                 info!("CONNECT response sent, starting VPN tunnel");
 
                                 // Hand off to VPN tunnel
-                                let tunnel = VpnTunnel::new(tls_stream);
-                                if let Err(e) = tunnel.run().await {
-                                    error!("Tunnel error: {}", e);
+                                use crate::vpn::tun_device::TunDevice;
+                                match TunDevice::new(None) {
+                                    Ok(tun) => {
+                                        info!("Created TUN device: {}", tun.name());
+                                        tun.configure_routing();
+                                        let tunnel = VpnTunnel::new(tls_stream, tun);
+                                        if let Err(e) = tunnel.run().await {
+                                            error!("Tunnel error: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to create TUN device: {}", e);
+                                    }
                                 }
                                 info!("VPN tunnel ended");
                                 return; // Exit the connection handler

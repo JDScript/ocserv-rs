@@ -31,7 +31,7 @@ openssl = "0.10"
 
 # Network utilities  
 ipnetwork = "0.20"
-tun-tap = "0.1"
+tun = { version = "0.6", features = ["async"] }
 pnet = "0.34"
 
 # Utilities
