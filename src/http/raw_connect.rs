@@ -23,9 +23,9 @@ pub fn build_connect_response(state: &ServerState) -> String {
 
     // Timeouts and keepalives
     response.push_str("X-CSTP-Lease-Duration: 86400\r\n");
-    response.push_str("X-CSTP-Session-Timeout: none\r\n");
-    response.push_str("X-CSTP-Idle-Timeout: none\r\n");
-    response.push_str("X-CSTP-Disconnected-Timeout: none\r\n");
+    response.push_str("X-CSTP-Session-Timeout: 0\r\n");
+    response.push_str("X-CSTP-Idle-Timeout: 0\r\n");
+    response.push_str("X-CSTP-Disconnected-Timeout: 0\r\n");
     response.push_str("X-CSTP-Keepalive: 30\r\n");
     response.push_str("X-CSTP-DPD: 30\r\n");
 
@@ -38,7 +38,7 @@ pub fn build_connect_response(state: &ServerState) -> String {
     response.push_str("X-CSTP-Keep: true\r\n");
     response.push_str("X-CSTP-TCP-Keepalive: true\r\n");
     response.push_str("X-CSTP-License: accept\r\n");
-    response.push_str("X-CSTP-Rekey-Method: none\r\n");
+    response.push_str("X-CSTP-Rekey-Method: new-tunnel\r\n");
 
     // Add DNS servers
     for dns in &net_config.dns_servers {

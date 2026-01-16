@@ -72,7 +72,8 @@ where
                     self.io.write_all(&resp.encode()).await?;
                 }
                 PacketType::Disconnect => {
-                    info!("Received DISCONNECT from client");
+                    let reason = String::from_utf8_lossy(&payload_bytes);
+                    info!("Received DISCONNECT from client. Reason: '{}'", reason);
                     break;
                 }
                 _ => {

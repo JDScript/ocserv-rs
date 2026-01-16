@@ -158,21 +158,34 @@ async fn handle_http_request(req: &HttpRequest, state: &Arc<ServerState>) -> Htt
             info!("AnyConnect manifest check: {}", p);
             HttpResponse::ok()
                 .header("Content-Type", "text/xml")
-                .body_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<vpn rev=\"1.0\">\n</vpn>\n")
+                .body_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<vpn rev=\"1.0\">\n<file-version>1.1.0</file-version>\n</vpn>\n")
         }
 
         ("GET", p) if p.starts_with("/+CSCOT+/") => {
-            info!("AnyConnect customization check: {}", p);
-            HttpResponse::ok()
-                .header("Content-Type", "text/xml")
-                .body_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<vpn rev=\"1.0\">\n</vpn>\n")
+            info!("AnyConnect customization check: {} - returning 404", p);
+            // ocserv returns 404 for these paths
+            HttpResponse::new(404, "Not found")
+                .header("Connection", "close")
+                .body_str("<html><body><h1>404 Not Found</h1></body></html>")
         }
 
-        ("GET", p) if p.starts_with("/1/") => {
-            info!("AnyConnect index/other check: {}", p);
+        ("GET", p) if p.ends_with("/1/index.html") => {
+            info!("AnyConnect index check: {}", p);
+            // ocserv returns 200 OK with <html></html> for index
             HttpResponse::ok()
+                .header("Connection", "Keep-Alive")
                 .header("Content-Type", "text/html")
-                .body_str("<html></html>\n")
+                .header("X-Transcend-Version", "1")
+                .body_str("<html></html>")
+        }
+
+        // For other /1/ paths (binaries, etc.), if not handled above, return 404
+        ("GET", p) if p.starts_with("/1/") => {
+            info!("AnyConnect unknown /1/ request: {} - returning 404", p);
+            HttpResponse::new(404, "Not Found")
+                .header("Connection", "close")
+                .header("X-Transcend-Version", "1")
+                .body_str("Not Found")
         }
 
         ("GET", "/logout") | ("GET", "//logout") => {
@@ -206,35 +219,62 @@ async fn handle_http_request(req: &HttpRequest, state: &Arc<ServerState>) -> Htt
 
 /// Handle initial auth request (GET or POST to /)
 fn handle_auth_init_manual(req: &HttpRequest, state: &Arc<ServerState>) -> HttpResponse {
-    // Check for existing session cookie
-    if let Some(cookie) = req.header("Cookie") {
-        if let Some(token) = extract_webvpn_token(cookie) {
-            if let Some(session) = state.session_manager.get_session_by_token(&token) {
-                info!("Valid session found: {}", session.session_id);
-                // Return session preserved response
-                return HttpResponse::ok()
-                    .header("Content-Type", "text/xml; charset=utf-8")
-                    .header("X-Transcend-Version", "1")
-                    .header("Cache-Control", "no-store")
-                    .header("Pragma", "no-cache")
-                    .header(
-                        "Set-Cookie",
-                        &format!(
-                            "webvpncontext={}; path=/; Secure; HttpOnly",
-                            session.session_id
-                        ),
-                    )
-                    .body_str(&build_auth_form_xml(state));
-            }
-        }
+    // Special case: HTTP/1.0 with Connection: close and no cookies
+    // This is likely a VPN agent keepalive/session check
+    // Don't return auth form - return webvpnlogin cookie to trigger proper auth flow
+    let connection = req.header("Connection").unwrap_or("");
+    let has_cookies = req.header("Cookie").is_some();
+
+    if req.version == 0 && connection.to_lowercase() == "close" && !has_cookies {
+        debug!(
+            "HTTP/1.0 Connection:close without cookies - VPN agent check - returning 204 No Content"
+        );
+        // 204 No Content is ideal for liveness probes
+        // It says "Success, but nothing to see here", avoiding auth parsing triggers
+        return HttpResponse::new(204, "No Content")
+            .header("X-Transcend-Version", "1")
+            .header("Connection", "close");
     }
 
-    // No session - return auth form
+    // Check for existing session cookie
+    if let Some(cookie) = req.header("Cookie") {
+        debug!("Got Cookie header: {}", cookie);
+        if let Some(token) = extract_webvpn_token(cookie) {
+            debug!("Extracted webvpn token: {}", token);
+            if let Some(session) = state.session_manager.get_session_by_token(&token) {
+                info!("Valid session found: {}", session.session_id);
+                // For AnyConnect, valid session should return success response (type="complete")
+                // Not the auth form - returning auth form causes logout!
+                use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+                let context_b64 = BASE64.encode(session.session_id.as_bytes());
+
+                let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<config-auth client=\"vpn\" type=\"complete\">\n<version who=\"sg\">0.1(1)</version>\n<auth id=\"success\">\n<title>SSL VPN Service</title>\n<banner>Welcome to AI4CE VPN</banner>\n</auth>\n</config-auth>";
+                return HttpResponse::ok()
+                    .header("Content-Type", "text/xml")
+                    .header("X-Transcend-Version", "1")
+                    .header(
+                        "Set-Cookie",
+                        &format!("webvpncontext={}; Secure; HttpOnly", context_b64),
+                    )
+                    .body_str(xml);
+            } else {
+                debug!("No session found for token");
+            }
+        } else {
+            debug!("No webvpn token in cookies");
+        }
+    } else {
+        debug!("No Cookie header in request");
+    }
+
+    // No session - return auth form with webvpncontext clearing (like ocserv)
     HttpResponse::ok()
-        .header("Content-Type", "text/xml; charset=utf-8")
+        .header(
+            "Set-Cookie",
+            "webvpncontext=; expires=Thu, 01 Jan 1970 22:00:00 GMT; path=/; Secure; HttpOnly",
+        )
+        .header("Content-Type", "text/xml")
         .header("X-Transcend-Version", "1")
-        .header("Cache-Control", "no-store")
-        .header("Pragma", "no-cache")
         .body_str(&build_auth_form_xml(state))
 }
 
@@ -262,7 +302,9 @@ fn handle_form_auth_manual(req: &HttpRequest, state: &Arc<ServerState>) -> HttpR
 fn create_auth_success_response(state: &Arc<ServerState>) -> HttpResponse {
     // Create new session with UserInfo
     use crate::auth::UserInfo;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
     use std::collections::HashMap;
+
     let user_info = UserInfo {
         username: "user".to_string(),
         groups: vec![],
@@ -272,18 +314,22 @@ fn create_auth_success_response(state: &Arc<ServerState>) -> HttpResponse {
     let session_id = &session.session_id;
     let session_token = &session.session_token;
 
-    // Build cookie values
-    let webvpncontext = format!("webvpncontext={}; path=/; Secure; HttpOnly", session_id);
-    let webvpn = format!(
-        "webvpn={}@{}@{}@{}; path=/; Secure; HttpOnly",
-        &session_token[..6],
-        session_id,
-        &session_token[6..10],
-        &session_token[10..13]
-    );
-    let webvpnc = format!(
+    // CRITICAL: ocserv uses THE SAME value for both webvpncontext and webvpn!
+    // This is what enables session sharing between AnyConnect components
+    let cookie_b64 = BASE64.encode(session_token.as_bytes());
+
+    // Build cookie values matching ocserv format - SAME value for both!
+    let webvpncontext = format!("webvpncontext={}; Secure; HttpOnly", cookie_b64);
+    let webvpn = format!("webvpn={}; Secure; HttpOnly", cookie_b64);
+
+    // webvpnc: ocserv sends TWO cookies - first clears old, then sets new
+    let webvpnc_clear =
+        "webvpnc=; expires=Thu, 01 Jan 1970 22:00:00 GMT; path=/; Secure; HttpOnly".to_string();
+
+    // AnyConnect might expect UPPERCASE hash?
+    let webvpnc_set = format!(
         "webvpnc=bu:/&p:t&iu:1/&sh:{}; path=/; Secure; HttpOnly",
-        state.cert_hash
+        state.cert_hash.to_uppercase()
     );
 
     let xml = r#"<config-auth client="vpn" type="complete">
@@ -296,19 +342,20 @@ fn create_auth_success_response(state: &Arc<ServerState>) -> HttpResponse {
 "#;
 
     HttpResponse::ok()
-        .header("Content-Type", "text/xml")
         .header("Connection", "Keep-Alive")
+        .header("Content-Type", "text/xml")
         .header("X-Transcend-Version", "1")
         .header("Set-Cookie", &webvpncontext)
         .header("Set-Cookie", &webvpn)
-        .header("Set-Cookie", &webvpnc)
+        .header("Set-Cookie", &webvpnc_clear)
+        .header("Set-Cookie", &webvpnc_set)
         .body_str(xml)
 }
 
 /// Build auth form XML
 fn build_auth_form_xml(_state: &Arc<ServerState>) -> String {
     r#"<?xml version="1.0" encoding="UTF-8"?>
-<config-auth client="vpn" type="auth-request">
+<config-auth client="vpn" type="auth-request" aggregate-auth-version="2">
     <version who="sg">0.1</version>
     <auth id="main">
         <title>Login</title>
@@ -324,11 +371,20 @@ fn build_auth_form_xml(_state: &Arc<ServerState>) -> String {
     .to_string()
 }
 
-/// Extract webvpn token from Cookie header
+/// Extract webvpn token from Cookie header (decodes Base64)
 fn extract_webvpn_token(cookie: &str) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
     for pair in cookie.split(';') {
         let pair = pair.trim();
         if let Some(value) = pair.strip_prefix("webvpn=") {
+            // Decode Base64 to get raw token
+            if let Ok(decoded) = BASE64.decode(value) {
+                if let Ok(token) = String::from_utf8(decoded) {
+                    return Some(token);
+                }
+            }
+            // If decode fails, try raw value (backward compat)
             return Some(value.to_string());
         }
     }
