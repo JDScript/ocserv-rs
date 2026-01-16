@@ -1,3 +1,3 @@
 fn main() {
-    println!("Hello, world!");
+    println!("ocserv-rs VPN Server - Phase 1 complete");
 }
