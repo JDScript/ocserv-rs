@@ -98,7 +98,7 @@ impl HttpServer {
 
                                 // Hand off to VPN tunnel
                                 use crate::vpn::tun_device::TunDevice;
-                                match TunDevice::new(None) {
+                                match TunDevice::new(None, &state.config.network) {
                                     Ok(tun) => {
                                         info!("Created TUN device: {}", tun.name());
                                         tun.configure_routing();

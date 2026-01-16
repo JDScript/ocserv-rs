@@ -9,17 +9,22 @@ use tracing::{debug, info};
 /// Build the raw CONNECT response with EXACT header casing
 pub fn build_connect_response(state: &ServerState) -> String {
     let net_config = &state.config.network;
-    let dummy_ip = "10.10.0.100";
     let link_mtu = net_config.mtu;
     let data_mtu = link_mtu.saturating_sub(32); // Account for CSTP overhead
+    
+    // Use the first available IP from the pool (TODO: real IPAM)
+    // For now, hardcode client IP but use P2P mask to force routing
+    let client_ip = "10.10.0.100"; 
 
     let mut response = String::new();
     response.push_str("HTTP/1.1 200 OK\r\n");
 
     // Core CSTP headers (EXACT CASE - OpenConnect uses strncmp which is case-sensitive!)
     response.push_str(&format!("X-CSTP-Version: 1\r\n"));
-    response.push_str(&format!("X-CSTP-Address: {}\r\n", dummy_ip));
-    response.push_str(&format!("X-CSTP-Netmask: 255.255.255.0\r\n"));
+    response.push_str(&format!("X-CSTP-Address: {}\r\n", client_ip));
+    
+    // Use /32 mask for Point-to-Point link to ensure default route works correctly
+    response.push_str(&format!("X-CSTP-Netmask: 255.255.255.255\r\n"));
 
     // Timeouts and keepalives
     response.push_str("X-CSTP-Lease-Duration: 86400\r\n");

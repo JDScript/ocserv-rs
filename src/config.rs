@@ -95,6 +95,8 @@ pub struct NetworkConfig {
     /// MTU
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+    /// NAT Interface (e.g. eth0, enp0s1). If None, auto-detected.
+    pub nat_interface: Option<String>,
 }
 
 impl Default for NetworkConfig {
@@ -105,6 +107,7 @@ impl Default for NetworkConfig {
             dns_servers: default_dns_servers(),
             split_include: Vec::new(),
             mtu: default_mtu(),
+            nat_interface: None,
         }
     }
 }
