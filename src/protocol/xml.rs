@@ -1,6 +1,6 @@
 use anyhow::Result;
 use lazy_static::lazy_static;
-use tera::{Context, Tera};
+use tera::Tera;
 
 lazy_static! {
     pub static ref TEMPLATES: Tera = {
@@ -15,9 +15,11 @@ lazy_static! {
     };
 }
 
-/// Render XML from template with context
-pub fn render_template(template_name: &str, context: &Context) -> Result<String> {
-    let rendered = TEMPLATES.render(template_name, context)?;
+/// Render XML from template with serde_json::Value context
+pub fn render_template(template_name: &str, context: &serde_json::Value) -> Result<String> {
+    use tera::Context;
+    let tera_context = Context::from_value(context.clone())?;
+    let rendered = TEMPLATES.render(template_name, &tera_context)?;
     Ok(rendered)
 }
 

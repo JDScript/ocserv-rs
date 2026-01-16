@@ -3,12 +3,14 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
+use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::{Authenticator, PasswordAuthenticator, SessionManager};
 use crate::protocol::{ConfigAuth, ConfigAuthType};
+use crate::xml::render_template;
 
 /// Server state shared across handlers
 pub struct ServerState {
@@ -143,18 +145,13 @@ async fn handle_tunnel_group_post(
 
 /// Handle initial auth - respond with auth-request
 async fn handle_auth_init() -> Result<Response<Full<Bytes>>> {
-    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<config-auth client="vpn" type="auth-request">
-    <version who="sg">0.1</version>
-    <auth id="main">
-        <title>Login</title>
-        <message>Please enter your username and password</message>
-        <form action="/auth" method="post">
-            <input label="Username:" name="username" type="text"></input>
-            <input label="Password:" name="password" type="password"></input>
-        </form>
-    </auth>
-</config-auth>"#;
+    let xml = render_template(
+        "auth_request_password.xml",
+        &json!({
+            "message": "Please enter your username and password",
+            "banner": "Welcome to the AI4CE VPN"
+        }),
+    )?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -217,25 +214,26 @@ async fn handle_auth_form_submit(
     // Authenticate
     match state.authenticator.authenticate(username, password) {
         Ok(user_info) => {
+            use crate::protocol::xml::render_template;
+            use serde_json::json;
+
             let session = state.session_manager.create_session(user_info);
 
-            let xml = format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<config-auth client="vpn" type="complete">
-    <session-id>{}</session-id>
-    <session-token>{}</session-token>
-    <auth id="success">
-        <message id="0" param1="" param2=""></message>
-    </auth>
-</config-auth>"#,
-                session.session_id, session.session_token
-            );
+            let xml = render_template(
+                "auth_complete.xml",
+                &json!({
+                    "session_id": session.session_id,
+                    "session_token": session.session_token,
+
+                }),
+            )?;
 
             info!("Authentication successful for user: {}", username);
 
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "text/xml; charset=utf-8")
+                .header("X-Transcend-Version", "1")
                 .header("Cache-Control", "no-store")
                 .header("Pragma", "no-cache")
                 .body(Full::new(Bytes::from(xml)))?)
@@ -272,23 +270,20 @@ async fn handle_xml_auth_reply(
         Ok(user_info) => {
             let session = state.session_manager.create_session(user_info);
 
-            let xml = format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<config-auth client="vpn" type="complete">
-    <session-id>{}</session-id>
-    <session-token>{}</session-token>
-    <auth id="success">
-        <message id="0" param1="" param2=""></message>
-    </auth>
-</config-auth>"#,
-                session.session_id, session.session_token
-            );
+            let xml = render_template(
+                "auth_complete.xml",
+                &json!({
+                    "session_id": session.session_id,
+                    "session_token": session.session_token,
+                }),
+            )?;
 
             info!("Authentication successful for user: {}", username);
 
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "text/xml; charset=utf-8")
+                .header("X-Transcend-Version", "1")
                 .header("Cache-Control", "no-store")
                 .header("Pragma", "no-cache")
                 .body(Full::new(Bytes::from(xml)))?)

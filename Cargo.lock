@@ -1364,6 +1364,7 @@ dependencies = [
  "rustls-pemfile",
  "samael",
  "serde",
+ "serde_json",
  "tera",
  "thiserror",
  "tokio 1.49.0",
