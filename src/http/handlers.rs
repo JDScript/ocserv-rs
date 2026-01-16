@@ -9,20 +9,31 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::{Authenticator, PasswordAuthenticator, SessionManager};
+use crate::config::Config;
+use crate::protocol::xml::render_template;
 use crate::protocol::{ConfigAuth, ConfigAuthType};
-use crate::xml::render_template;
 
 /// Server state shared across handlers
 pub struct ServerState {
     pub authenticator: Arc<dyn Authenticator>,
     pub session_manager: Arc<SessionManager>,
+    pub config: Arc<Config>,
 }
 
 impl ServerState {
-    pub fn new() -> Self {
+    pub fn new(config: Arc<Config>) -> Self {
+        let authenticator: Arc<dyn Authenticator> = if config.auth.password.enabled {
+            Arc::new(PasswordAuthenticator::new(
+                config.auth.password.users.clone(),
+            ))
+        } else {
+            Arc::new(PasswordAuthenticator::with_defaults())
+        };
+
         Self {
-            authenticator: Arc::new(PasswordAuthenticator::new()),
+            authenticator,
             session_manager: Arc::new(SessionManager::new()),
+            config,
         }
     }
 }
@@ -82,7 +93,7 @@ async fn handle_request_internal(
         // GET requests - AnyConnect may use GET for initial handshake
         (&Method::GET, path) if !path.starts_with("/+CSCOE+") => {
             info!("Handling GET request - likely AnyConnect initial request");
-            handle_auth_init().await
+            handle_auth_init(state).await
         }
 
         // POST to /auth - can be XML or form data
@@ -129,7 +140,7 @@ async fn handle_tunnel_group_post(
     match config_auth.auth_type {
         ConfigAuthType::Init => {
             // Client is initiating connection
-            handle_auth_init().await
+            handle_auth_init(state).await
         }
 
         ConfigAuthType::AuthReply => {
@@ -144,12 +155,12 @@ async fn handle_tunnel_group_post(
 }
 
 /// Handle initial auth - respond with auth-request
-async fn handle_auth_init() -> Result<Response<Full<Bytes>>> {
+async fn handle_auth_init(state: Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
     let xml = render_template(
         "auth_request_password.xml",
         &json!({
             "message": "Please enter your username and password",
-            "banner": "Welcome to the AI4CE VPN"
+            "banner": state.config.auth.banner.clone()
         }),
     )?;
 

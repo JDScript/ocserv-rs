@@ -1,0 +1,50 @@
+# Example configuration file for ocserv-rs
+# Copy this to config.toml and customize
+
+## Server Configuration
+[server]
+# Address and port to listen on
+listen = "0.0.0.0:8443"
+
+# TLS certificate and private key paths
+cert_path = "server.crt"
+key_path = "server.key"
+
+## Authentication Configuration
+[auth]
+# Banner message shown to users during login
+# Optional - omit to disable banner
+banner = "Welcome to AI4CE VPN"
+
+### Password Authentication
+[auth.password]
+# Enable password-based authentication
+enabled = true
+
+# User list
+# TODO: Future enhancement - support password hashing (bcrypt/argon2)
+# For now, passwords are stored in plaintext in config file
+# Make sure to protect this file with proper permissions!
+
+[[auth.password.users]]
+username = "test"
+password = "test"
+
+[[auth.password.users]]
+username = "admin"
+password = "admin"
+
+[[auth.password.users]]
+username = "user1"
+password = "pass1"
+
+### SAML/SSO Authentication (Phase 4 - Not yet implemented)
+[auth.saml]
+enabled = false
+
+# Uncomment and configure these when implementing SAML in Phase 4:
+# idp_metadata_url = "https://idp.example.com/metadata"
+# sp_entity_id = "https://vpn.example.com/saml"
+# sp_acs_url = "https://vpn.example.com/saml/acs"
+# sp_cert_path = "sp.crt"
+# sp_key_path = "sp.key"

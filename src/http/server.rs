@@ -1,7 +1,6 @@
 use anyhow::Result;
-use hyper::body::Incoming;
+use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::Request;
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9,20 +8,21 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info};
 
+use crate::config::Config;
 use crate::http::handlers::{handle_request, ServerState};
 
 pub struct HttpServer {
     addr: SocketAddr,
     tls_acceptor: TlsAcceptor,
-    state: Arc<ServerState>,
+    config: Arc<Config>,
 }
 
 impl HttpServer {
-    pub fn new(addr: SocketAddr, tls_acceptor: TlsAcceptor) -> Self {
+    pub fn new(addr: SocketAddr, tls_acceptor: TlsAcceptor, config: Arc<Config>) -> Self {
         Self {
             addr,
             tls_acceptor,
-            state: Arc::new(ServerState::new()),
+            config,
         }
     }
 
@@ -30,47 +30,37 @@ impl HttpServer {
         let listener = TcpListener::bind(self.addr).await?;
         info!("HTTP server listening on {}", self.addr);
 
-        let tls_acceptor = Arc::new(self.tls_acceptor);
-        let state = self.state;
+        // Create shared server state
+        let state = Arc::new(ServerState::new(self.config.clone()));
 
         loop {
-            let (stream, peer_addr) = listener.accept().await?;
-            let tls_acceptor = tls_acceptor.clone();
+            let (tcp_stream, remote_addr) = listener.accept().await?;
+            let tls_acceptor = self.tls_acceptor.clone();
             let state = state.clone();
 
             tokio::spawn(async move {
-                if let Err(e) =
-                    Self::handle_connection(stream, peer_addr, tls_acceptor, state).await
-                {
-                    error!("Error handling connection from {}: {}", peer_addr, e);
+                match tls_acceptor.accept(tcp_stream).await {
+                    Ok(tls_stream) => {
+                        info!("TLS connection established from {}", remote_addr);
+
+                        // Wrap TLS stream in TokioIo for Hyper 1.0 compatibility
+                        let io = TokioIo::new(tls_stream);
+
+                        let svc_state = state.clone();
+                        let service = service_fn(move |req| {
+                            let state = svc_state.clone();
+                            async move { handle_request(req, state).await }
+                        });
+
+                        if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+                            error!("Error handling connection from {}: {}", remote_addr, e);
+                        }
+                    }
+                    Err(e) => {
+                        error!("TLS handshake failed from {}: {}", remote_addr, e);
+                    }
                 }
             });
         }
-    }
-
-    async fn handle_connection(
-        stream: tokio::net::TcpStream,
-        peer_addr: SocketAddr,
-        tls_acceptor: Arc<TlsAcceptor>,
-        state: Arc<ServerState>,
-    ) -> Result<()> {
-        // Perform TLS handshake
-        let tls_stream = tls_acceptor.accept(stream).await?;
-        info!("TLS connection established from {}", peer_addr);
-
-        let io = TokioIo::new(tls_stream);
-
-        // Create HTTP/1.1 connection
-        let service = service_fn(move |req: Request<Incoming>| {
-            let state = state.clone();
-            async move { handle_request(req, state).await }
-        });
-
-        // Serve HTTP requests over the TLS connection
-        hyper::server::conn::http1::Builder::new()
-            .serve_connection(io, service)
-            .await?;
-
-        Ok(())
     }
 }

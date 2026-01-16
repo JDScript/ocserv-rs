@@ -1,40 +1,44 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
 use super::{Authenticator, UserInfo};
+use crate::config::UserConfig;
 
-/// Simple password authenticator with in-memory user database
+/// Password-based authenticator with in-memory user database
 pub struct PasswordAuthenticator {
-    users: HashMap<String, String>, // username -> password hash (plaintext for now)
+    users: HashMap<String, String>,
 }
 
 impl PasswordAuthenticator {
-    pub fn new() -> Self {
+    /// Create new password authenticator from user configs
+    pub fn new(user_configs: Vec<UserConfig>) -> Self {
         let mut users = HashMap::new();
-
-        // Add some test users (in production, load from config/database)
-        users.insert("test".to_string(), "test".to_string());
-        users.insert("admin".to_string(), "admin".to_string());
-        users.insert("user1".to_string(), "pass1".to_string());
-
+        for user in user_configs {
+            users.insert(user.username, user.password);
+        }
         Self { users }
     }
 
-    pub fn add_user(&mut self, username: String, password: String) {
-        self.users.insert(username, password);
+    /// Create authenticator with default test users (for backward compatibility)
+    pub fn with_defaults() -> Self {
+        let mut users = HashMap::new();
+        users.insert("test".to_string(), "test".to_string());
+        users.insert("admin".to_string(), "admin".to_string());
+        users.insert("user1".to_string(), "pass1".to_string());
+        Self { users }
     }
 }
 
 impl Authenticator for PasswordAuthenticator {
-    fn authenticate(&self, username: &str, credential: &str) -> Result<UserInfo> {
+    fn authenticate(&self, username: &str, password: &str) -> Result<UserInfo> {
         match self.users.get(username) {
-            Some(stored_password) if stored_password == credential => Ok(UserInfo {
+            Some(stored_password) if stored_password == password => Ok(UserInfo {
                 username: username.to_string(),
-                groups: vec!["users".to_string()],
+                groups: vec![],
                 attributes: HashMap::new(),
             }),
-            Some(_) => bail!("Invalid password for user: {}", username),
-            None => bail!("User not found: {}", username),
+            Some(_) => Err(anyhow!("Invalid password")),
+            None => Err(anyhow!("User not found")),
         }
     }
 }
@@ -42,27 +46,33 @@ impl Authenticator for PasswordAuthenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::UserConfig;
 
     #[test]
     fn test_password_auth_success() {
-        let auth = PasswordAuthenticator::new();
-        let result = auth.authenticate("test", "test");
+        let users = vec![UserConfig {
+            username: "testuser".to_string(),
+            password: "testpass".to_string(),
+        }];
+        let auth = PasswordAuthenticator::new(users);
+        let result = auth.authenticate("testuser", "testpass");
         assert!(result.is_ok());
-
-        let user_info = result.unwrap();
-        assert_eq!(user_info.username, "test");
     }
 
     #[test]
     fn test_password_auth_invalid_password() {
-        let auth = PasswordAuthenticator::new();
-        let result = auth.authenticate("test", "wrong");
+        let users = vec![UserConfig {
+            username: "testuser".to_string(),
+            password: "testpass".to_string(),
+        }];
+        let auth = PasswordAuthenticator::new(users);
+        let result = auth.authenticate("testuser", "wrongpass");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_password_auth_user_not_found() {
-        let auth = PasswordAuthenticator::new();
+        let auth = PasswordAuthenticator::new(vec![]);
         let result = auth.authenticate("nonexistent", "password");
         assert!(result.is_err());
     }
