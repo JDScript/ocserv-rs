@@ -1,2 +1,4 @@
+server.crt
+server.key
 /target
 /references
