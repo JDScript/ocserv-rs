@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="ie=edge">
+    <title>External Browser SAML Authentication</title>
+</head>
+
+<body>
+    <div id="logs" style="padding: 20px; font-family: sans-serif;">
+        <h2>Authentication Successful</h2>
+        <p>Please wait while we redirect you back to the AnyConnect app...</p>
+    </div>
+</body>
+
+<script>
+    // Simplified version of the provided script logic for the template
+    (function () {
+        function getCookie(name) {
+            var value = "; " + document.cookie;
+            var parts = value.split("; " + name + "=");
+            if (parts.length === 2) return parts.pop().split(";").shift();
+        }
+
+        function getOS() {
+            var ua = window.navigator.userAgent;
+            var platform = window.navigator.platform;
+            if (["Macintosh", "MacIntel", "MacPPC", "Mac68K"].indexOf(platform) !== -1) return "macos";
+            if (["iPhone", "iPad", "iPod"].indexOf(platform) !== -1) return "ios";
+            if (["Win32", "Win64", "Windows", "WinCE"].indexOf(platform) !== -1) return "windows";
+            if (/Android/.test(ua)) return "android";
+            return "unknown";
+        }
+
+        var token = "{{ token }}";
+        if (!token || token.indexOf("{" + "{") === 0) {
+            token = getCookie("acSamlv2Token");
+        }
+
+        if (!token) {
+            document.getElementById("logs").innerHTML += "<p style='color: red;'>Error: SSO Token not found. Please try logging in again.</p>";
+            return;
+        }
+
+        console.log("Token found, triggering redirection...");
+        var os = getOS();
+        var encodedToken = encodeURIComponent(token);
+
+        if (os === "ios" || os === "macos") {
+            var uri = "anyconnectsso://externalsso?token=" + encodedToken;
+            console.log("Opening custom URI: " + uri);
+            window.location.href = uri;
+        } else if (os === "android") {
+            var uri = "anyconnect://externalsso?token=" + encodedToken;
+            console.log("Opening custom URI: " + uri);
+            window.location.href = uri;
+        } else {
+            // Windows/Linux/Other: Trigger local AnyConnect API
+            var returnUrl = encodeURIComponent(window.location.href + (window.location.href.indexOf("?") === -1 ? "?" : "&") + "done=1");
+            var localApi = "http://localhost:29786/api/sso/" + encodedToken + "?return=" + returnUrl;
+            console.log("Redirecting to local API: " + localApi);
+            window.location.href = localApi;
+        }
+
+        // Show manual link if auto-redirect fails
+        setTimeout(function () {
+            document.getElementById("logs").innerHTML += "<p>If you are not redirected automatically, <a href='javascript:location.reload()'>click here to retry</a>.</p>";
+        }, 5000);
+    })();
+</script>
+
+</html>

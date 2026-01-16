@@ -1,9 +1,9 @@
-//! HTTP Handlers - now minimal, most logic moved to server.rs for manual HTTP handling
-
-use std::sync::Arc;
-
 use crate::auth::{Authenticator, PasswordAuthenticator, SessionManager};
 use crate::config::Config;
+use std::sync::Arc;
+
+pub mod auth;
+pub mod sso;
 
 /// Server state shared across handlers
 pub struct ServerState {

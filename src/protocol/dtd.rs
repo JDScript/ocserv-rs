@@ -122,7 +122,9 @@ pub struct Auth {
     #[serde(default)]
     pub form: Vec<Form>,
 
-    // Password auth fields
+    #[serde(rename = "sso-token", skip_serializing_if = "Option::is_none")]
+    pub sso_token: Option<String>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
 
@@ -276,6 +278,7 @@ impl Default for Auth {
             sso_v2_token_cookie_name: None,
             sso_v2_error_cookie_name: None,
             form: vec![],
+            sso_token: None,
             username: None,
             password: None,
         }

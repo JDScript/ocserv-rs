@@ -25,6 +25,22 @@ impl HttpRequest {
             .find(|(k, _)| k.to_lowercase() == name_lower)
             .map(|(_, v)| v.as_str())
     }
+
+    /// Parse x-www-form-urlencoded body
+    pub fn parse_form(&self) -> HashMap<String, String> {
+        let body = String::from_utf8_lossy(&self.body);
+        body.split('&')
+            .filter_map(|pair| {
+                let mut parts = pair.splitn(2, '=');
+                let key = parts.next()?;
+                let value = parts.next().unwrap_or("");
+                Some((
+                    urlencoding::decode(key).ok()?.into_owned(),
+                    urlencoding::decode(value).ok()?.into_owned(),
+                ))
+            })
+            .collect()
+    }
 }
 
 /// HTTP response builder with EXACT header casing
