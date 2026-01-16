@@ -56,10 +56,23 @@ pub struct SamlAuthConfig {
     /// Whether SAML auth is enabled
     #[serde(default)]
     pub enabled: bool,
-    /// IdP metadata URL (Phase 4)
+    /// IdP metadata URL (e.g. https://shibboleth.nyu.edu/idp/profile/SAML2/Redirect/SSO)
+    /// This is where we redirect the user for login
     pub idp_metadata_url: Option<String>,
-    /// Service Provider entity ID (Phase 4)
+    /// IdP Entity ID (for validating Issuer in SAMLResponse)
+    pub idp_entity_id: Option<String>,
+    /// SP Entity ID (our identifier, e.g. https://vpn.example.com/saml)
     pub sp_entity_id: Option<String>,
+    /// SP ACS URL (where IdP posts back, e.g. https://vpn.example.com/+CSCOE+/saml/sp/acs)
+    pub acs_url: Option<String>,
+
+    /// Base URL for constructing absolute links (e.g. https://vpn.example.com)
+    /// Required for correct AnyConnect behavior
+    pub base_url: Option<String>,
+
+    /// Development Mode: Enable built-in Mock IdP at /dev/idp
+    #[serde(default)]
+    pub dev_idp_enabled: bool,
 }
 
 impl Config {
@@ -131,6 +144,12 @@ password = "pass1"
 
 [auth.saml]
 enabled = false
+idp_metadata_url = "https://mock-idp"
+idp_entity_id = "mock-idp"
+sp_entity_id = "my-vpn"
+acs_url = "https://vpn/acs"
+base_url = "https://vpn"
+dev_idp_enabled = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.listen, "127.0.0.1:8443");

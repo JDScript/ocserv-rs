@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config-auth client="vpn" type="auth-request" aggregate-auth-version="2">
+    <version who="sg">0.1</version>
+    <opaque is-for="sg">
+        <tunnel-group>{{ tunnel_group }}</tunnel-group>
+        <auth-method>single-sign-on-v2</auth-method>
+        <auth-method>single-sign-on-external-browser</auth-method>
+    </opaque>
+    <auth id="main">
+        <title>Login</title>
+        <message>Please complete the authentication process in the browser window.</message>
+        {% if banner %}
+        <banner>{{ banner }}</banner>
+        {% endif %}
+        <sso-v2-login>{{ sso_login_url | safe }}</sso-v2-login>
+        <sso-v2-login-final>{{ sso_login_final_url | safe }}</sso-v2-login-final>
+        <sso-v2-browser-mode>external</sso-v2-browser-mode>
+        <sso-v2-token-cookie-name>acSamlv2Token</sso-v2-token-cookie-name>
+        <sso-v2-error-cookie-name>acSamlv2Error</sso-v2-error-cookie-name>
+        <form>
+            <input type="sso" name="sso-token"></input>
+        </form>
+    </auth>
+</config-auth>

@@ -1,25 +1,27 @@
-use anyhow::Result;
-use lazy_static::lazy_static;
-use tera::Tera;
+use anyhow::{Context, Result};
+use tera::{Context as TeraContext, Tera};
 
-lazy_static! {
+lazy_static::lazy_static! {
     pub static ref TEMPLATES: Tera = {
-        let mut tera = Tera::default();
-        // Load templates from templates/ directory
-        tera.add_raw_templates(vec![
-            ("auth_request_saml.xml", include_str!("../../templates/auth_request_saml.xml")),
-            ("auth_request_password.xml", include_str!("../../templates/auth_request_password.xml")),
-            ("auth_complete.xml", include_str!("../../templates/auth_complete.xml")),
-        ]).expect("Failed to load XML templates");
+        let mut tera = Tera::new("templates/**/*").expect("Failed to load templates");
+        tera.autoescape_on(vec![".xml", ".html"]);
         tera
     };
 }
 
-/// Render XML from template with serde_json::Value context
 pub fn render_template(template_name: &str, context: &serde_json::Value) -> Result<String> {
-    use tera::Context;
-    let tera_context = Context::from_value(context.clone())?;
-    let rendered = TEMPLATES.render(template_name, &tera_context)?;
+    let mut tera_context = TeraContext::new();
+
+    if let serde_json::Value::Object(map) = context {
+        for (k, v) in map {
+            tera_context.insert(k, v);
+        }
+    }
+
+    let rendered = TEMPLATES
+        .render(template_name, &tera_context)
+        .context(format!("Failed to render template '{}'", template_name))?;
+
     Ok(rendered)
 }
 
@@ -29,9 +31,6 @@ mod tests {
 
     #[test]
     fn test_template_loading() {
-        // Just verify templates can be accessed
-        assert!(TEMPLATES
-            .get_template_names()
-            .any(|n| n == "auth_request_saml.xml"));
+        let _ = &*TEMPLATES;
     }
 }

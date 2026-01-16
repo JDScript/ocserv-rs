@@ -46,5 +46,6 @@ enabled = false
 # idp_metadata_url = "https://idp.example.com/metadata"
 # sp_entity_id = "https://vpn.example.com/saml"
 # sp_acs_url = "https://vpn.example.com/saml/acs"
+# base_url = "https://vpn.example.com"
 # sp_cert_path = "sp.crt"
 # sp_key_path = "sp.key"
