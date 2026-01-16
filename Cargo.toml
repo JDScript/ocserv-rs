@@ -49,3 +49,5 @@ url = "2.5"
 # Configuration
 toml = "0.8"
 clap = { version = "4.4", features = ["derive"] }
+rand = "0.9.2"
+urlencoding = "2.1.3"

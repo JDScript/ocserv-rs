@@ -25,6 +25,12 @@ pub struct ConfigAuth {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opaque: Option<Opaque>,
 
+    #[serde(rename = "device-id", skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Capabilities>,
+
     #[serde(rename = "session-id", skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
 
@@ -73,8 +79,8 @@ pub struct Opaque {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Auth {
-    #[serde(rename = "@id")]
-    pub id: String,
+    #[serde(rename = "@id", skip_serializing_if = "Option::is_none", default)]
+    pub id: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -182,6 +188,13 @@ pub struct Config {
     // Will be extended with VPN configuration elements later
 }
 
+/// Client capabilities
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct Capabilities {
+    #[serde(rename = "auth-method", default)]
+    pub auth_methods: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,7 +229,7 @@ mod tests {
                 config_hash: None,
             }),
             auth: vec![Auth {
-                id: "main".to_string(),
+                id: Some("main".to_string()),
                 title: Some("Login".to_string()),
                 message: Some("Please authenticate".to_string()),
                 sso_v2_login: Some("https://example.com/saml/login".to_string()),
@@ -236,6 +249,8 @@ mod tests {
                 ..Default::default()
             }],
             version: vec![],
+            device_id: None,
+            capabilities: None,
             session_id: None,
             session_token: None,
             config: None,
@@ -250,7 +265,7 @@ mod tests {
 impl Default for Auth {
     fn default() -> Self {
         Self {
-            id: String::new(),
+            id: None,
             title: None,
             message: None,
             banner: None,

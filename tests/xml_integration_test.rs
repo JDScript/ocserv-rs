@@ -24,7 +24,7 @@ fn test_xml_auth_reply_parse() {
 
     let config: ConfigAuth = quick_xml::de::from_str(xml).unwrap();
     assert_eq!(config.auth_type, ConfigAuthType::AuthReply);
-    assert_eq!(config.auth[0].id, "main");
+    assert_eq!(config.auth[0].id, Some("main".to_string()));
     assert_eq!(config.auth[0].username, Some("testuser".to_string()));
     assert_eq!(config.auth[0].password, Some("testpass".to_string()));
 }
@@ -37,10 +37,12 @@ fn test_xml_complete_serialize() {
         aggregate_auth_version: None,
         version: vec![],
         auth: vec![Auth {
-            id: "success".to_string(),
+            id: Some("success".to_string()),
             ..Default::default()
         }],
         opaque: None,
+        device_id: None,
+        capabilities: None,
         session_id: Some("12345".to_string()),
         session_token: Some("TOKEN@12345@HASH".to_string()),
         config: None,
