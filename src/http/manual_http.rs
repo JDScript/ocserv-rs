@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 /// Maximum size for HTTP headers
 const MAX_HEADERS_SIZE: usize = 8192;
@@ -124,7 +124,7 @@ pub async fn read_request<S>(stream: &mut S) -> io::Result<Option<HttpRequest>>
 where
     S: AsyncReadExt + Unpin,
 {
-    info!("read_request: Starting to read HTTP request...");
+    trace!("read_request: Starting to read HTTP request...");
     let mut buf = vec![0u8; MAX_HEADERS_SIZE];
     let mut total_read = 0;
 
@@ -137,12 +137,12 @@ where
             ));
         }
 
-        debug!(
+        trace!(
             "read_request: About to read from stream (total_read={})",
             total_read
         );
         let n = stream.read(&mut buf[total_read..]).await?;
-        debug!("read_request: Read {} bytes", n);
+        trace!("read_request: Read {} bytes", n);
         if n == 0 {
             if total_read == 0 {
                 return Ok(None); // Clean EOF
@@ -156,14 +156,14 @@ where
 
         // Debug: Log what we received
         let data_preview = String::from_utf8_lossy(&buf[..std::cmp::min(total_read, 200)]);
-        debug!(
+        trace!(
             "read_request: Data preview (first 200 chars): {:?}",
             data_preview
         );
 
         // Check for end of headers
         if let Some(pos) = find_header_end(&buf[..total_read]) {
-            debug!("read_request: Found header end at position {}", pos);
+            trace!("read_request: Found header end at position {}", pos);
             // Include the full \r\n\r\n - httparse needs this to know headers are complete
             let header_bytes = &buf[..pos + 4];
             let body_start = pos + 4; // Skip \r\n\r\n
@@ -172,7 +172,7 @@ where
             let mut headers_buf = [httparse::EMPTY_HEADER; 64];
             let mut req = httparse::Request::new(&mut headers_buf);
 
-            debug!(
+            trace!(
                 "read_request: Parsing {} bytes of headers (buf[..{}])",
                 header_bytes.len(),
                 pos + 4
@@ -180,7 +180,7 @@ where
 
             match req.parse(header_bytes) {
                 Ok(httparse::Status::Complete(parsed_len)) => {
-                    debug!(
+                    trace!(
                         "read_request: httparse Complete, parsed {} bytes",
                         parsed_len
                     );
@@ -240,7 +240,7 @@ where
                 }
                 Ok(httparse::Status::Partial) => {
                     // Need more data, continue reading
-                    debug!("read_request: httparse returned Partial, need more data");
+                    trace!("read_request: httparse returned Partial, need more data");
                     continue;
                 }
                 Err(e) => {

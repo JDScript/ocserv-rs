@@ -74,7 +74,7 @@ impl HttpServer {
                                 }
                             };
 
-                            debug!("Received {} request to {}", request.method, request.path);
+                            info!("Received {} request to {}", request.method, request.path);
 
                             // Handle CONNECT specially - upgrade to VPN tunnel
                             if request.method == "CONNECT" && request.path == "/CSCOSSLC/tunnel" {
