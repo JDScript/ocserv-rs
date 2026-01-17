@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod http;
 pub mod protocol;
 pub mod tls_config;
+pub mod utils;
 pub mod vpn;
 
 // Re-export commonly used items
