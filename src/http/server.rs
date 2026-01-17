@@ -172,6 +172,8 @@ impl HttpServer {
                                             DtlsSessionInfo {
                                                 psk: psk.to_vec(),
                                                 tun_tx: None,
+                                                dtls_signal_tx: None,
+                                                dtls_out_rx: None,
                                             },
                                         );
 
@@ -227,6 +229,8 @@ impl HttpServer {
                                                 psk: hex::decode(_master_secret)
                                                     .unwrap_or_default(),
                                                 tun_tx: None,
+                                                dtls_signal_tx: None,
+                                                dtls_out_rx: None,
                                             },
                                         );
                                     }
@@ -241,18 +245,37 @@ impl HttpServer {
                                     }));
                                 }
 
+                                // Allocate IP address for the client
+                                let assigned_ip = match state.ip_pool.allocate() {
+                                    Ok(ip) => ip,
+                                    Err(e) => {
+                                        warn!("Failed to allocate IP address: {}", e);
+                                        break;
+                                    }
+                                };
+                                let gateway_ip = state.ip_pool.gateway();
+                                info!(
+                                    "Allocated IP {} for client (Gateway: {})",
+                                    assigned_ip, gateway_ip
+                                );
+
                                 // Send CONNECT response with DTLS headers if supported
-                                let response_str =
-                                    build_connect_response(&state, dtls_config.as_ref());
+                                let response_str = build_connect_response(
+                                    &state,
+                                    dtls_config.as_ref(),
+                                    assigned_ip,
+                                );
                                 debug!("Sending CONNECT response:\n{}", response_str);
 
                                 if let Err(e) = tls_stream.write_all(response_str.as_bytes()).await
                                 {
-                                    error!("Failed to write CONNECT response: {}", e);
+                                    warn!("Failed to write CONNECT response: {}", e);
+                                    state.ip_pool.release(assigned_ip);
                                     break;
                                 }
                                 if let Err(e) = tls_stream.flush().await {
-                                    error!("Failed to flush CONNECT response: {}", e);
+                                    warn!("Failed to flush CONNECT response: {}", e);
+                                    state.ip_pool.release(assigned_ip);
                                     break;
                                 }
 
@@ -262,70 +285,84 @@ impl HttpServer {
                                 use crate::vpn::tun_device::TunDevice;
                                 use tokio::sync::mpsc;
 
-                                match TunDevice::new(None, &state.config.network) {
-                                    Ok(tun) => {
-                                        info!("Created TUN device: {}", tun.name());
-                                        tun.configure_routing();
+                                // Configure TUN device
+                                let tun = match TunDevice::new(
+                                    None,
+                                    &state.config.network,
+                                    gateway_ip,
+                                    assigned_ip,
+                                ) {
+                                    Ok(tun) => tun,
+                                    Err(e) => {
+                                        warn!("Failed to create TUN device: {}", e);
+                                        state.ip_pool.release(assigned_ip);
+                                        break;
+                                    }
+                                };
 
-                                        // Extract DTLS session ID if DTLS is configured
-                                        let dtls_session_id = match &dtls_config {
-                                            Some(DtlsConfig::Psk(p)) => Some(p.app_id.clone()),
-                                            Some(DtlsConfig::Legacy(l)) => {
-                                                Some(l.session_id.clone())
-                                            }
-                                            None => None,
-                                        };
+                                // Extract DTLS session ID if DTLS is configured
+                                let dtls_session_id = match &dtls_config {
+                                    Some(DtlsConfig::Psk(p)) => Some(p.app_id.clone()),
+                                    Some(DtlsConfig::Legacy(l)) => Some(l.session_id.clone()),
+                                    None => None,
+                                };
 
-                                        // Create channel for DTLS packets if DTLS is enabled
-                                        let tunnel = if let Some(session_id) = dtls_session_id {
-                                            let (dtls_tx, dtls_rx) = mpsc::channel::<bytes::Bytes>(
-                                                state.config.performance.channel_capacity,
+                                // Create channel for DTLS packets if DTLS is enabled
+                                let tunnel = if let Some(session_id) = dtls_session_id {
+                                    // Channel for outgoing DTLS packets (TUN -> DTLS task)
+                                    let (out_dtls_tx, out_dtls_rx) = mpsc::channel::<bytes::Bytes>(
+                                        state.config.performance.channel_capacity,
+                                    );
+
+                                    let (dtls_tx, dtls_rx) = mpsc::channel::<bytes::Bytes>(
+                                        state.config.performance.channel_capacity,
+                                    );
+                                    // Channel for DTLS readiness signal
+                                    let (signal_tx, signal_rx) = mpsc::channel(10);
+
+                                    // Update DTLS session with the tun_tx channel
+                                    {
+                                        let mut sessions = state.dtls_sessions.write().unwrap();
+                                        if let Some(info) = sessions.get_mut(&session_id) {
+                                            info.tun_tx = Some(dtls_tx);
+                                            info.dtls_signal_tx = Some(signal_tx);
+                                            info.dtls_out_rx = Some(out_dtls_rx);
+                                            info!(
+                                                "Linked DTLS session {} to TUN device",
+                                                session_id
                                             );
-
-                                            // Update DTLS session with the tun_tx channel
-                                            {
-                                                let mut sessions =
-                                                    state.dtls_sessions.write().unwrap();
-                                                if let Some(info) = sessions.get_mut(&session_id) {
-                                                    info.tun_tx = Some(dtls_tx);
-                                                    info!(
-                                                        "Linked DTLS session {} to TUN device",
-                                                        session_id
-                                                    );
-                                                } else {
-                                                    warn!(
-                                                        "DTLS session {} not found in store",
-                                                        session_id
-                                                    );
-                                                }
-                                            }
-
-                                            VpnTunnel::with_dtls(
-                                                tls_stream,
-                                                tun,
-                                                dtls_rx,
-                                                state.config.performance.buffer_size,
-                                                state.config.performance.channel_capacity,
-                                            )
                                         } else {
-                                            VpnTunnel::new(
-                                                tls_stream,
-                                                tun,
-                                                state.config.performance.buffer_size,
-                                                state.config.performance.channel_capacity,
-                                            )
-                                        };
-
-                                        if let Err(e) = tunnel.run().await {
-                                            error!("Tunnel error: {}", e);
+                                            warn!("DTLS session {} not found in store", session_id);
                                         }
                                     }
-                                    Err(e) => {
-                                        error!("Failed to create TUN device: {}", e);
-                                    }
+
+                                    VpnTunnel::with_dtls(
+                                        tls_stream,
+                                        tun,
+                                        dtls_rx,
+                                        signal_rx,
+                                        out_dtls_tx,
+                                        state.config.performance.buffer_size,
+                                        state.config.performance.channel_capacity,
+                                    )
+                                } else {
+                                    VpnTunnel::new(
+                                        tls_stream,
+                                        tun,
+                                        state.config.performance.buffer_size,
+                                        state.config.performance.channel_capacity,
+                                    )
+                                };
+
+                                // Run the tunnel
+                                if let Err(e) = tunnel.run().await {
+                                    warn!("VPN tunnel ended with error: {}", e);
                                 }
-                                info!("VPN tunnel ended");
-                                return; // Exit the connection handler
+
+                                // Release IP address
+                                state.ip_pool.release(assigned_ip);
+                                info!("Released IP {}", assigned_ip);
+                                break; // End connection after tunnel closes
                             }
 
                             // Handle regular HTTP requests

@@ -1,6 +1,7 @@
 use crate::auth::{Authenticator, PasswordAuthenticator, SessionManager};
 use crate::config::Config;
 use crate::vpn::dtls::DtlsSessionStore;
+use crate::vpn::ip_pool::SharedIpPool;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -14,6 +15,7 @@ pub struct ServerState {
     pub config: Arc<Config>,
     pub cert_hash: String,
     pub dtls_sessions: DtlsSessionStore,
+    pub ip_pool: SharedIpPool,
 }
 
 impl ServerState {
@@ -26,13 +28,17 @@ impl ServerState {
             Arc::new(PasswordAuthenticator::with_defaults())
         };
 
+        // Initialize IP Pool from config
+        let ip_pool =
+            SharedIpPool::new(&config.network.ipv4_pool).expect("Failed to initialize IP pool");
+
         Self {
             authenticator,
             session_manager: Arc::new(SessionManager::new()),
             config,
             cert_hash,
             dtls_sessions: Arc::new(RwLock::new(HashMap::new())),
+            ip_pool,
         }
     }
 }
-

@@ -23,6 +23,10 @@ pub struct DtlsSessionInfo {
     pub psk: Vec<u8>,
     /// Channel to send packets to the TUN device
     pub tun_tx: Option<mpsc::Sender<Bytes>>,
+    /// Channel to signal VpnTunnel that DTLS is ready (socket, addr)
+    pub dtls_signal_tx: Option<mpsc::Sender<(Arc<UdpSocket>, SocketAddr)>>,
+    /// Channel to receive packets intended for the client (outgoing)
+    pub dtls_out_rx: Option<mpsc::Receiver<Bytes>>,
 }
 
 /// Thread-safe store mapping session_id (hex) -> session info
@@ -417,13 +421,31 @@ async fn handle_dtls_session(
     Pin::new(&mut stream).accept().await?;
     info!("DTLS handshake completed with {}", addr);
 
-    // Get TUN sender for this session
-    let tun_tx = {
-        let sessions = store.read().unwrap();
-        sessions
-            .get(&session_id)
-            .and_then(|info| info.tun_tx.clone())
+    // Get TUN sender, DTLS signal channel, and DTLS outgoing receiver
+    let (tun_tx, dtls_signal_tx, mut dtls_out_rx) = {
+        let mut sessions = store.write().unwrap();
+        if let Some(info) = sessions.get_mut(&session_id) {
+            (
+                info.tun_tx.clone(),
+                info.dtls_signal_tx.clone(),
+                info.dtls_out_rx.take(),
+            )
+        } else {
+            (None, None, None)
+        }
     };
+
+    // Notify VpnTunnel that DTLS is ready for outgoing packets
+    if let Some(signal_tx) = dtls_signal_tx {
+        if signal_tx.send((socket.clone(), addr)).await.is_err() {
+            warn!("Failed to signal VpnTunnel for DTLS session {}", session_id);
+        } else {
+            info!(
+                "Signaled VpnTunnel: DTLS ready for outgoing traffic to {}",
+                addr
+            );
+        }
+    }
 
     let tun_tx = match tun_tx {
         Some(tx) => tx,
@@ -433,60 +455,89 @@ async fn handle_dtls_session(
         }
     };
 
-    // Main data loop
+    // Main data loop - multiplex incoming (client->server) and outgoing (server->client)
     let mut buf = [0u8; 4096];
 
     loop {
-        let n = match stream.read(&mut buf).await {
-            Ok(0) => {
-                info!("DTLS session {} closed (EOF)", addr);
-                break;
-            }
-            Ok(n) => n,
-            Err(e) => {
-                warn!("DTLS read error from {}: {}", addr, e);
-                break;
-            }
-        };
+        tokio::select! {
+            // Incoming packets from Client (via SSL stream)
+            res = stream.read(&mut buf) => {
+                let n = match res {
+                    Ok(0) => {
+                        info!("DTLS session {} closed (EOF)", addr);
+                        break;
+                    },
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!("DTLS read error from {}: {}", addr, e);
+                        break;
+                    }
+                };
 
-        if n == 0 {
-            continue;
-        }
+                // Handle packet based on type (1-byte header)
+                // Note: The OpenSSL stream handles DTLS Record Layer.
+                // The payload here is the application data, which ocserv framing says starts with 1-byte type.
+                let pkt_type = buf[0];
 
-        // Handle packet based on type (1-byte header)
-        let pkt_type = buf[0];
-
-        match pkt_type {
-            packet_type::DATA => {
-                // Strip 1-byte header and forward to TUN
-                let data = Bytes::copy_from_slice(&buf[1..n]);
-                if tun_tx.send(data).await.is_err() {
-                    warn!("TUN channel closed for session {}", addr);
-                    break;
+                match pkt_type {
+                    packet_type::DATA => {
+                        // Strip 1-byte header and forward to TUN
+                        let data = Bytes::copy_from_slice(&buf[1..n]);
+                        if tun_tx.send(data).await.is_err() {
+                            warn!("TUN channel closed for session {}", addr);
+                            break;
+                        }
+                    }
+                    packet_type::DPD_REQ => {
+                         let resp = [packet_type::DPD_RESP];
+                        if let Err(e) = stream.write_all(&resp).await {
+                             warn!("Failed to send DPD-RESP to {}: {}", addr, e);
+                        }
+                    }
+                    packet_type::KEEPALIVE => {
+                         let resp = [packet_type::KEEPALIVE];
+                        if let Err(e) = stream.write_all(&resp).await {
+                             warn!("Failed to send KEEPALIVE to {}: {}", addr, e);
+                        }
+                    }
+                    packet_type::DISCONNECT => {
+                        info!("Received DISCONNECT from {}", addr);
+                        break;
+                    }
+                     _ => {
+                        debug!("Unknown packet type 0x{:02x} from {}", pkt_type, addr);
+                    }
                 }
             }
-            packet_type::DPD_REQ => {
-                // Respond with DPD-RESP
-                debug!("Received DPD-REQ from {}, sending DPD-RESP", addr);
-                let resp = [packet_type::DPD_RESP];
-                if let Err(e) = stream.write_all(&resp).await {
-                    warn!("Failed to send DPD-RESP to {}: {}", addr, e);
+
+            // Outgoing packets to Client (from TUN, via channel)
+            outgoing = async {
+                match dtls_out_rx {
+                    Some(ref mut rx) => rx.recv().await,
+                    None => std::future::pending().await,
                 }
-            }
-            packet_type::KEEPALIVE => {
-                // Respond with KEEPALIVE
-                debug!("Received KEEPALIVE from {}", addr);
-                let resp = [packet_type::KEEPALIVE];
-                if let Err(e) = stream.write_all(&resp).await {
-                    warn!("Failed to send KEEPALIVE to {}: {}", addr, e);
+            }, if dtls_out_rx.is_some() => {
+                 match outgoing {
+                    Some(data) => {
+                        // Write to DTLS stream (encrypts and wraps in DTLS record)
+                        // Data from VpnTunnel via channel already includes IP Header.
+                        // We need to prepend the 1-byte DATA header (0x00).
+
+                        // Create buffer with header
+                        let mut pkt = Vec::with_capacity(1 + data.len());
+                        pkt.push(packet_type::DATA);
+                        pkt.extend_from_slice(&data);
+
+                        if let Err(e) = stream.write_all(&pkt).await {
+                             warn!("DTLS write error to {}: {}", addr, e);
+                             break;
+                        }
+                    }
+                    None => {
+                        debug!("DTLS outgoing channel closed");
+                        dtls_out_rx = None;
+                    }
                 }
-            }
-            packet_type::DISCONNECT => {
-                info!("Received DISCONNECT from {}", addr);
-                break;
-            }
-            _ => {
-                debug!("Unknown packet type 0x{:02x} from {}", pkt_type, addr);
             }
         }
     }

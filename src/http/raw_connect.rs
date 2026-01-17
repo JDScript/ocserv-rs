@@ -32,21 +32,21 @@ pub enum DtlsConfig {
 }
 
 /// Build the raw CONNECT response with EXACT header casing
-pub fn build_connect_response(state: &ServerState, dtls_config: Option<&DtlsConfig>) -> String {
+pub fn build_connect_response(
+    state: &ServerState,
+    dtls_config: Option<&DtlsConfig>,
+    assigned_ip: std::net::Ipv4Addr,
+) -> String {
     let net_config = &state.config.network;
     let link_mtu = net_config.mtu;
     let data_mtu = link_mtu.saturating_sub(32); // Account for CSTP overhead
-
-    // Use the first available IP from the pool (TODO: real IPAM)
-    // For now, hardcode client IP but use P2P mask to force routing
-    let client_ip = "10.10.0.100";
 
     let mut response = String::new();
     response.push_str("HTTP/1.1 200 OK\r\n");
 
     // Core CSTP headers (EXACT CASE - OpenConnect uses strncmp which is case-sensitive!)
     response.push_str(&format!("X-CSTP-Version: 1\r\n"));
-    response.push_str(&format!("X-CSTP-Address: {}\r\n", client_ip));
+    response.push_str(&format!("X-CSTP-Address: {}\r\n", assigned_ip));
 
     // Use /32 mask for Point-to-Point link to ensure default route works correctly
     response.push_str(&format!("X-CSTP-Netmask: 255.255.255.255\r\n"));
@@ -181,6 +181,8 @@ pub async fn handle_connect_raw(
                     DtlsSessionInfo {
                         psk: psk.to_vec(),
                         tun_tx: None, // Will be set when VpnTunnel starts
+                        dtls_signal_tx: None,
+                        dtls_out_rx: None,
                     },
                 );
                 info!("Registered DTLS session with App-ID: {}", app_id_hex);
@@ -198,7 +200,9 @@ pub async fn handle_connect_raw(
     }
 
     // Build and send the response with EXACT case headers
-    let response = build_connect_response(&state, dtls_config.as_ref());
+    // Use a temporary IP for this raw handler path (mostly used for testing/legacy)
+    let temp_ip = "10.10.0.100".parse().unwrap();
+    let response = build_connect_response(&state, dtls_config.as_ref(), temp_ip);
     debug!("Sending raw CONNECT response:\n{}", response);
 
     stream

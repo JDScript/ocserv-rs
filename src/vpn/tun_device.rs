@@ -1,10 +1,10 @@
+use crate::config::NetworkConfig;
 use anyhow::{Context, Result};
 use std::process::Command;
 use tokio::io::{ReadHalf, WriteHalf};
 use tracing::{info, warn};
 use tun::AsyncDevice;
 use tun::Device as _;
-use crate::config::NetworkConfig;
 
 /// Wrapper around the platform-specific TUN device
 pub struct TunDevice {
@@ -17,50 +17,46 @@ impl TunDevice {
     ///
     /// If `name` is provided, attempts to use that specific interface name.
     /// If `None`, relies on the OS to assign the next available name (e.g., utun0, utun1...).
-    pub fn new(name: Option<&str>, net_config: &NetworkConfig) -> Result<Self> {
+    pub fn new(
+        name: Option<&str>,
+        net_config: &NetworkConfig,
+        local_ip: std::net::Ipv4Addr,
+        peer_ip: std::net::Ipv4Addr,
+    ) -> Result<Self> {
         let mut config = tun::Configuration::default();
 
         if let Some(n) = name {
             config.name(n);
         }
 
-        // Parse IPv4 pool (e.g., "10.10.0.0/24")
-        // We need: Server IP (e.g., 10.10.0.1), Netmask, Destination (for P2P)
-        // For simplicity, we assume the first IP in the subnet is the server.
-        // TODO: Use a proper CIDR library for robust parsing.
-        let pool_parts: Vec<&str> = net_config.ipv4_pool.split('/').collect();
-        let ip_base = pool_parts.get(0).unwrap_or(&"10.10.0.0");
-        let cidr_suffix = pool_parts.get(1).unwrap_or(&"24");
-        
-        // Very basic IP logic for now: assume x.x.x.0 -> x.x.x.1 as server
-        let server_ip = if ip_base.ends_with(".0") {
-            format!("{}{}", &ip_base[..ip_base.len()-1], "1")
-        } else {
-            "10.10.0.1".to_string()
-        };
+        // Configure as Point-to-Point interface
+        // This is crucial for supporting multiple TUN devices sharing the same server IP.
+
+        info!("Configuring TUN: Server={}, Client={}", local_ip, peer_ip);
 
         #[cfg(target_os = "linux")]
         {
-            config.address(&server_ip);
-            config.netmask("255.255.255.0"); // TODO: calculate from cidr_suffix
+            config.address(&local_ip);
+            config.destination(&peer_ip);
+            config.netmask("255.255.255.255"); // Host route for P2P
             config.mtu(net_config.mtu as i32);
             config.up();
         }
 
         #[cfg(target_os = "macos")]
         {
-            config.address(&server_ip);
-            config.destination("10.10.0.100"); // Point-to-point destination (Client IP)
-            config.netmask("255.255.255.0");
+            config.address(&local_ip);
+            config.destination(&peer_ip);
+            config.netmask("255.255.255.255");
             config.mtu(net_config.mtu as i32);
             config.up();
         }
 
         let device = tun::create_as_async(&config).context("Failed to create TUN device")?;
 
-        Ok(Self { 
+        Ok(Self {
             device,
-            config: net_config.clone()
+            config: net_config.clone(),
         })
     }
 
@@ -102,10 +98,10 @@ impl TunDevice {
                         .output()
                         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                         .unwrap_or_default();
-                    
+
                     if output.is_empty() {
-                         warn!("Could not auto-detect WAN interface for NAT. Defaulting to eth0.");
-                         "eth0".to_string()
+                        warn!("Could not auto-detect WAN interface for NAT. Defaulting to eth0.");
+                        "eth0".to_string()
                     } else {
                         info!("Auto-detected WAN interface for NAT: {}", output);
                         output
@@ -116,10 +112,10 @@ impl TunDevice {
             // Setup NAT (Simple Masquerade)
             // iptables -t nat -A POSTROUTING -o <wan_iface> -j MASQUERADE
             info!("Configuring Linux NAT for {} -> {}...", name, wan_iface);
-            
+
             // First, try to clean up old rules to prevent duplicates (optional, strictly speaking)
             // But for now we just append.
-            
+
             let _ = Command::new("iptables")
                 .args(&[
                     "-t",

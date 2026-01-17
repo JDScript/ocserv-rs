@@ -2,6 +2,7 @@ use crate::vpn::cstp::{CstpPacket, PacketType, CSTP_HEADER_LEN};
 use crate::vpn::tun_device::TunDevice;
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -11,6 +12,10 @@ pub struct VpnTunnel<IO> {
     tun: TunDevice,
     /// Optional receiver for DTLS packets to write to TUN
     dtls_rx: Option<mpsc::Receiver<Bytes>>,
+    /// Optional receiver for DTLS readiness signal (socket, addr)
+    dtls_signal_rx: Option<mpsc::Receiver<(Arc<tokio::net::UdpSocket>, std::net::SocketAddr)>>,
+    /// Channel to send outgoing packets to DTLS session task
+    dtls_out_tx: Option<mpsc::Sender<Bytes>>,
     // Configurable performance parameters
     buffer_size: usize,
     channel_capacity: usize,
@@ -25,6 +30,8 @@ where
             io,
             tun,
             dtls_rx: None,
+            dtls_signal_rx: None,
+            dtls_out_tx: None,
             buffer_size,
             channel_capacity,
         }
@@ -35,6 +42,8 @@ where
         io: IO,
         tun: TunDevice,
         dtls_rx: mpsc::Receiver<Bytes>,
+        dtls_signal_rx: mpsc::Receiver<(Arc<tokio::net::UdpSocket>, std::net::SocketAddr)>,
+        dtls_out_tx: mpsc::Sender<Bytes>,
         buffer_size: usize,
         channel_capacity: usize,
     ) -> Self {
@@ -42,6 +51,8 @@ where
             io,
             tun,
             dtls_rx: Some(dtls_rx),
+            dtls_signal_rx: Some(dtls_signal_rx),
+            dtls_out_tx: Some(dtls_out_tx),
             buffer_size,
             channel_capacity,
         }
@@ -69,30 +80,73 @@ where
             debug!("TLS Writer task finished");
         });
 
-        // 2. TUN Reader Task: Reads IP packets from TUN, wraps in CSTP, sends to TLS Writer
+        // 2. TUN Reader Task: Reads IP packets from TUN, wraps in CSTP, sends to TLS Writer (or DTLS channel)
         let tx_sender_tun = tx_sender.clone();
+        let mut dtls_signal_rx = self.dtls_signal_rx;
+        let dtls_out_tx = self.dtls_out_tx.clone();
+
         let tun_reader_handle = tokio::spawn(async move {
             info!("TUN Reader task started");
-            // Use larger buffer for potential jumbo frames and efficiency
             let mut buf = vec![0u8; self.buffer_size];
+            let mut use_dtls = false;
+
             loop {
-                match tun_r.read(&mut buf).await {
-                    Ok(n) => {
-                        if n == 0 {
-                            break; // EOF
+                tokio::select! {
+                    // 1. Handle DTLS signal (if channel exists)
+                    signal = async {
+                        match dtls_signal_rx {
+                            Some(ref mut rx) => rx.recv().await,
+                            None => std::future::pending::<Option<(Arc<tokio::net::UdpSocket>, std::net::SocketAddr)>>().await,
                         }
-
-                        let payload = Bytes::copy_from_slice(&buf[..n]);
-
-                        // Wrap in CSTP DATA packet
-                        let packet = CstpPacket::new(PacketType::Data, payload);
-                        if let Err(_) = tx_sender_tun.send(packet.encode()).await {
-                            break; // Channel closed
+                    }, if dtls_signal_rx.is_some() => {
+                        match signal {
+                            Some((_socket, _addr)) => {
+                                info!("VPN Tunnel: Switched outgoing traffic to DTLS channel");
+                                use_dtls = true;
+                            },
+                            None => {
+                                // Channel closed, disable DTLS
+                                use_dtls = false;
+                                dtls_signal_rx = None; // Stop polling
+                            }
                         }
                     }
-                    Err(e) => {
-                        error!("TUN read error: {}", e);
-                        break;
+
+                    // 2. Read from TUN
+                    res = tun_r.read(&mut buf) => {
+                        match res {
+                            Ok(n) => {
+                                if n == 0 {
+                                    break; // EOF
+                                }
+
+                                let payload = bytes::Bytes::copy_from_slice(&buf[..n]);
+                                let packet = CstpPacket::new(PacketType::Data, payload.clone());
+
+                                // Optimization: Try sending via DTLS channel if enabled
+                                let mut sent_via_dtls = false;
+                                if use_dtls {
+                                    if let Some(ref tx) = dtls_out_tx {
+                                        // Send raw payload to dtls task (it will encrypt and frame it)
+                                        if let Err(e) = tx.send(payload).await {
+                                            warn!("DTLS channel full/closed (reverting to TLS): {}", e);
+                                        } else {
+                                            sent_via_dtls = true;
+                                        }
+                                    }
+                                }
+
+                                if !sent_via_dtls {
+                                    if let Err(_) = tx_sender_tun.send(packet.encode()).await {
+                                        break; // Channel closed
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("TUN read error: {}", e);
+                                break;
+                            }
+                        }
                     }
                 }
             }
