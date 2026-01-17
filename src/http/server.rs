@@ -445,7 +445,7 @@ async fn handle_http_request(req: &HttpRequest, state: &Arc<ServerState>) -> Htt
             debug!("AnyConnect manifest check: {}", p);
             HttpResponse::ok()
                 .header("Content-Type", "text/xml")
-                .body_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<vpn rev=\"1.0\">\n<file-version>1.1.0</file-version>\n</vpn>\n")
+                .body_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<vpn rev=\"1.0\"></vpn>\n")
         }
 
         ("GET", p) if p.starts_with("/+CSCOT+/") => {
@@ -466,11 +466,12 @@ async fn handle_http_request(req: &HttpRequest, state: &Arc<ServerState>) -> Htt
 
         // For other /1/ paths
         ("GET", p) if p.starts_with("/1/") => {
-            debug!("AnyConnect unknown /1/ request: {} - returning 404", p);
-            HttpResponse::new(404, "Not Found")
-                .header("Connection", "close")
+            debug!("AnyConnect unknown /1/ request: {} - returning 200", p);
+            HttpResponse::ok()
+                .header("Connection", "Keep-Alive")
+                .header("Content-Type", "text/html")
                 .header("X-Transcend-Version", "1")
-                .body_str("Not Found")
+                .body_str("<html></html>")
         }
 
         ("GET", "/logout") | ("GET", "//logout") => {
