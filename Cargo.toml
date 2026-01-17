@@ -28,6 +28,8 @@ lazy_static = "1.4"
 # SAML support
 samael = "0.0.15"
 openssl = "0.10"
+tokio-openssl = "0.6"
+foreign-types = "0.3"
 
 # Network utilities  
 ipnetwork = "0.20"

@@ -1,20 +1,45 @@
 use crate::http::handlers::ServerState;
+use crate::vpn::dtls::{DtlsSessionInfo, DtlsSessionStore};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// PSK-based DTLS parameters (modern OpenConnect mode)
+pub struct DtlsParams {
+    pub port: u16,
+    pub app_id: String, // Hex-encoded session identifier
+    pub rekey_time: u32,
+    pub keepalive: u32,
+}
+
+/// Legacy DTLS parameters (AnyConnect compatibility mode)
+pub struct LegacyDtlsParams {
+    pub port: u16,
+    pub session_id: String,          // Hex-encoded 32-byte session ID
+    pub ciphersuite: String,         // Selected cipher (e.g., "AES256-GCM-SHA384")
+    pub ciphersuite_is_dtls12: bool, // Use X-DTLS12-CipherSuite header
+    pub rekey_time: u32,
+    pub keepalive: u32,
+}
+
+/// Combined DTLS configuration
+pub enum DtlsConfig {
+    Psk(DtlsParams),
+    Legacy(LegacyDtlsParams),
+}
 
 /// Build the raw CONNECT response with EXACT header casing
-pub fn build_connect_response(state: &ServerState) -> String {
+pub fn build_connect_response(state: &ServerState, dtls_config: Option<&DtlsConfig>) -> String {
     let net_config = &state.config.network;
     let link_mtu = net_config.mtu;
     let data_mtu = link_mtu.saturating_sub(32); // Account for CSTP overhead
-    
+
     // Use the first available IP from the pool (TODO: real IPAM)
     // For now, hardcode client IP but use P2P mask to force routing
-    let client_ip = "10.10.0.100"; 
+    let client_ip = "10.10.0.100";
 
     let mut response = String::new();
     response.push_str("HTTP/1.1 200 OK\r\n");
@@ -22,7 +47,7 @@ pub fn build_connect_response(state: &ServerState) -> String {
     // Core CSTP headers (EXACT CASE - OpenConnect uses strncmp which is case-sensitive!)
     response.push_str(&format!("X-CSTP-Version: 1\r\n"));
     response.push_str(&format!("X-CSTP-Address: {}\r\n", client_ip));
-    
+
     // Use /32 mask for Point-to-Point link to ensure default route works correctly
     response.push_str(&format!("X-CSTP-Netmask: 255.255.255.255\r\n"));
 
@@ -55,6 +80,43 @@ pub fn build_connect_response(state: &ServerState) -> String {
         response.push_str(&format!("X-CSTP-Split-Include: {}\r\n", route));
     }
 
+    // Add DTLS headers based on mode
+    match dtls_config {
+        Some(DtlsConfig::Psk(dtls)) => {
+            response.push_str(&format!("X-DTLS-Port: {}\r\n", dtls.port));
+            response.push_str("X-DTLS-CipherSuite: PSK-NEGOTIATE\r\n");
+            response.push_str(&format!("X-DTLS-App-ID: {}\r\n", dtls.app_id));
+            response.push_str(&format!("X-DTLS-Rekey-Time: {}\r\n", dtls.rekey_time));
+            response.push_str("X-DTLS-Rekey-Method: ssl\r\n");
+            response.push_str(&format!("X-DTLS-Keepalive: {}\r\n", dtls.keepalive));
+            response.push_str("X-DTLS-DPD: 30\r\n");
+            info!("Added DTLS-PSK headers: App-ID={}", dtls.app_id);
+        }
+        Some(DtlsConfig::Legacy(dtls)) => {
+            response.push_str(&format!("X-DTLS-Port: {}\r\n", dtls.port));
+            response.push_str(&format!("X-DTLS-Session-ID: {}\r\n", dtls.session_id));
+
+            // Use correct header based on DTLS version
+            if dtls.ciphersuite_is_dtls12 {
+                response.push_str(&format!("X-DTLS12-CipherSuite: {}\r\n", dtls.ciphersuite));
+            } else {
+                response.push_str(&format!("X-DTLS-CipherSuite: {}\r\n", dtls.ciphersuite));
+            }
+
+            response.push_str(&format!("X-DTLS-Rekey-Time: {}\r\n", dtls.rekey_time));
+            response.push_str("X-DTLS-Rekey-Method: ssl\r\n");
+            response.push_str(&format!("X-DTLS-Keepalive: {}\r\n", dtls.keepalive));
+            response.push_str("X-DTLS-DPD: 30\r\n");
+            // For legacy mode, also send MTU
+            response.push_str(&format!("X-DTLS-MTU: {}\r\n", data_mtu));
+            info!(
+                "Added legacy DTLS headers: Session-ID={}, Cipher={}",
+                dtls.session_id, dtls.ciphersuite
+            );
+        }
+        None => {}
+    }
+
     // End headers
     response.push_str("\r\n");
 
@@ -77,11 +139,66 @@ pub async fn handle_connect_raw(
 
     info!("Detected CONNECT request, handling with raw HTTP response");
 
-    // Read until we get the full headers (double CRLF)
-    // For now, assume initial_data contains enough - in production we'd buffer more
+    // Parse headers to check for DTLS support
+    let mut dtls_config: Option<DtlsConfig> = None;
+
+    // Check if client supports PSK-NEGOTIATE
+    let supports_dtls_psk =
+        data_str.contains("X-DTLS-CipherSuite") && data_str.contains("PSK-NEGOTIATE");
+
+    if supports_dtls_psk {
+        info!("Client supports DTLS with PSK-NEGOTIATE");
+
+        // Generate 32-byte App-ID (session identifier)
+        let app_id_bytes: [u8; 32] = rand::random();
+        let app_id_hex = hex::encode(&app_id_bytes);
+
+        // Export PSK from TLS session using RFC 5705 exporter
+        // Label: "EXPORTER-openconnect-psk", no context, 32 bytes
+        let mut psk = [0u8; 32];
+
+        // Access the underlying rustls connection to export keying material
+        let (_, tls_conn) = stream.get_ref();
+        let exported = tls_conn.export_keying_material(
+            &mut psk,
+            b"EXPORTER-openconnect-psk",
+            None, // No context per protocol spec
+        );
+
+        if let Err(e) = exported {
+            warn!("Failed to export PSK: {:?}", e);
+        } else {
+            info!("Exported 32-byte PSK for DTLS session");
+
+            // Get DTLS port from config
+            let dtls_port = state.config.server.dtls_port.unwrap_or(8443);
+
+            // Register session in DTLS store
+            {
+                let mut sessions = state.dtls_sessions.write().unwrap();
+                sessions.insert(
+                    app_id_hex.clone(),
+                    DtlsSessionInfo {
+                        psk: psk.to_vec(),
+                        tun_tx: None, // Will be set when VpnTunnel starts
+                    },
+                );
+                info!("Registered DTLS session with App-ID: {}", app_id_hex);
+            }
+
+            dtls_config = Some(DtlsConfig::Psk(DtlsParams {
+                port: dtls_port,
+                app_id: app_id_hex,
+                rekey_time: 86400,
+                keepalive: 30,
+            }));
+        }
+    } else {
+        debug!("Client does not support DTLS-PSK, TCP-only tunnel");
+    }
 
     // Build and send the response with EXACT case headers
-    let response = build_connect_response(&state);
+    let response = build_connect_response(&state, dtls_config.as_ref());
     debug!("Sending raw CONNECT response:\n{}", response);
 
     stream
@@ -96,13 +213,8 @@ pub async fn handle_connect_raw(
     info!("CONNECT response sent, starting VPN tunnel");
 
     // Now hand off to VPN tunnel
-    // We need to wrap the stream for VpnTunnel
-    // VpnTunnel expects something implementing tokio AsyncRead/AsyncWrite
-    // TlsStream<TcpStream> already implements these!
-
-    // Actually we need to take ownership of the stream here
-    // This is tricky because we have a mutable reference...
-    // We'll need to refactor the caller to pass ownership
+    // This function returns true to indicate CONNECT was handled
+    // The caller is responsible for starting the VPN tunnel
 
     Ok(true)
 }

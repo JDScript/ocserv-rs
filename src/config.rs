@@ -21,6 +21,8 @@ pub struct ServerConfig {
     pub cert_path: String,
     /// Path to TLS private key
     pub key_path: String,
+    /// DTLS UDP port (optional, default 8443)
+    pub dtls_port: Option<u16>,
 }
 
 /// Authentication configuration
@@ -140,6 +142,7 @@ impl Config {
                 listen: "0.0.0.0:8443".to_string(),
                 cert_path: "server.crt".to_string(),
                 key_path: "server.key".to_string(),
+                dtls_port: Some(8443),
             },
             auth: AuthConfig {
                 banner: Some("Welcome to VPN".to_string()),

@@ -9,6 +9,8 @@ use tracing::{debug, error, info, warn};
 pub struct VpnTunnel<IO> {
     io: IO,
     tun: TunDevice,
+    /// Optional receiver for DTLS packets to write to TUN
+    dtls_rx: Option<mpsc::Receiver<Bytes>>,
 }
 
 impl<IO> VpnTunnel<IO>
@@ -16,10 +18,23 @@ where
     IO: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
     pub fn new(io: IO, tun: TunDevice) -> Self {
-        Self { io, tun }
+        Self {
+            io,
+            tun,
+            dtls_rx: None,
+        }
     }
 
-    pub async fn run(self) -> Result<()> {
+    /// Create a new tunnel with DTLS support
+    pub fn with_dtls(io: IO, tun: TunDevice, dtls_rx: mpsc::Receiver<Bytes>) -> Self {
+        Self {
+            io,
+            tun,
+            dtls_rx: Some(dtls_rx),
+        }
+    }
+
+    pub async fn run(mut self) -> Result<()> {
         info!("VPN Tunnel loop started for interface: {}", self.tun.name());
 
         let (mut tls_r, mut tls_w) = tokio::io::split(self.io);
@@ -69,6 +84,38 @@ where
             debug!("TUN Reader task finished");
         });
 
+        // 2b. DTLS Reader Task: Reads decapsulated IP packets from DTLS, writes to TUN
+        // Create a channel for TUN writes shared between TLS reader and DTLS reader
+        let (tun_write_tx, mut tun_write_rx) = mpsc::channel::<Bytes>(100);
+
+        // Spawn TUN write task
+        let tun_writer_handle = tokio::spawn(async move {
+            while let Some(packet) = tun_write_rx.recv().await {
+                if let Err(e) = tun_w.write_all(&packet).await {
+                    error!("TUN write error: {}", e);
+                    break;
+                }
+            }
+            debug!("TUN Writer task finished");
+        });
+
+        // DTLS reader (if enabled)
+        let dtls_reader_handle = if let Some(mut dtls_rx) = self.dtls_rx.take() {
+            let tun_write_tx_dtls = tun_write_tx.clone();
+            Some(tokio::spawn(async move {
+                info!("DTLS Reader task started");
+                while let Some(packet) = dtls_rx.recv().await {
+                    // DTLS packets are already decapsulated IP packets (no CSTP header)
+                    if let Err(_) = tun_write_tx_dtls.send(packet).await {
+                        break;
+                    }
+                }
+                debug!("DTLS Reader task finished");
+            }))
+        } else {
+            None
+        };
+
         // 3. TLS Reader Task: Reads CSTP packets, writes Data to TUN, sends Control replies to TLS Writer
         let mut buf = BytesMut::with_capacity(4096);
         let mut result = Ok(());
@@ -110,9 +157,9 @@ where
             // Process Packet
             match packet_type {
                 PacketType::Data => {
-                    // Decapsulate and write to TUN
-                    if let Err(e) = tun_w.write_all(&payload_bytes).await {
-                        error!("TUN write error: {}", e);
+                    // Decapsulate and send to TUN writer task
+                    if let Err(_) = tun_write_tx.send(payload_bytes).await {
+                        error!("TUN write channel closed");
                         break;
                     }
                 }
@@ -143,6 +190,10 @@ where
         // Abort background tasks
         tls_writer_handle.abort();
         tun_reader_handle.abort();
+        tun_writer_handle.abort();
+        if let Some(h) = dtls_reader_handle {
+            h.abort();
+        }
 
         result
     }

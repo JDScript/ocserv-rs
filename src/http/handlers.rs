@@ -1,6 +1,8 @@
 use crate::auth::{Authenticator, PasswordAuthenticator, SessionManager};
 use crate::config::Config;
-use std::sync::Arc;
+use crate::vpn::dtls::DtlsSessionStore;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 pub mod auth;
 pub mod sso;
@@ -11,6 +13,7 @@ pub struct ServerState {
     pub session_manager: Arc<SessionManager>,
     pub config: Arc<Config>,
     pub cert_hash: String,
+    pub dtls_sessions: DtlsSessionStore,
 }
 
 impl ServerState {
@@ -28,6 +31,8 @@ impl ServerState {
             session_manager: Arc::new(SessionManager::new()),
             config,
             cert_hash,
+            dtls_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
+
