@@ -43,15 +43,6 @@ impl TunDevice {
             config.up();
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            config.address(&local_ip);
-            config.destination(&peer_ip);
-            config.netmask("255.255.255.255");
-            config.mtu(net_config.mtu as i32);
-            config.up();
-        }
-
         let device = tun::create_as_async(&config).context("Failed to create TUN device")?;
 
         Ok(Self {
@@ -128,21 +119,6 @@ impl TunDevice {
                     "MASQUERADE",
                 ])
                 .output();
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            // Enable IP forwarding
-            let _ = Command::new("sysctl")
-                .arg("-w")
-                .arg("net.inet.ip.forwarding=1")
-                .output();
-
-            info!("Enabled IP forwarding on macOS for {}. NAT requires manual PF configuration or internet sharing.", name);
-            // macOS PF (Packet Filter) automation is complex and risky to automate in dev.
-            // We log a helpful message instead of potentially breaking network.
-            warn!("To enable full internet access for clients on macOS:");
-            warn!("  echo \"nat on en0 from 10.10.0.0/24 to any -> (en0)\" | sudo pfctl -f -");
         }
     }
 }
