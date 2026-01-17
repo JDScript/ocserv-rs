@@ -11,11 +11,56 @@ use std::task::{Context as TaskContext, Poll};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use foreign_types::ForeignTypeRef;
+use openssl::pkey::Id;
 use openssl::ssl::{SslAcceptor, SslContext, SslMethod, SslVerifyMode};
+use openssl::x509::X509;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Detect certificate type and return appropriate DTLS cipher suite.
+///
+/// EC (ECDSA) certificates require ECDHE-ECDSA ciphers.
+/// RSA certificates require ECDHE-RSA or DHE-RSA ciphers.
+fn detect_cipher_suite_for_cert(cert_path: &str) -> Result<&'static str> {
+    let cert_pem = std::fs::read(cert_path)
+        .context(format!("Failed to read certificate file: {}", cert_path))?;
+
+    let cert = X509::from_pem(&cert_pem).context("Failed to parse certificate PEM")?;
+
+    let pubkey = cert
+        .public_key()
+        .context("Failed to extract public key from certificate")?;
+
+    match pubkey.id() {
+        Id::EC => {
+            info!("Detected EC (ECDSA) certificate - using ECDHE-ECDSA cipher suites");
+            Ok(
+                "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:\
+                ECDHE-ECDSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:\
+                PSK-AES256-GCM-SHA384:PSK-AES128-GCM-SHA256",
+            )
+        }
+        Id::RSA => {
+            info!("Detected RSA certificate - using ECDHE-RSA/DHE-RSA cipher suites");
+            Ok("ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:\
+                ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256:\
+                DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:\
+                PSK-AES256-GCM-SHA384:PSK-AES128-GCM-SHA256")
+        }
+        other => {
+            warn!(
+                "Unknown certificate key type {:?} - using broad cipher suite",
+                other
+            );
+            Ok("ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
+                ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
+                DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:\
+                PSK-AES256-GCM-SHA384:PSK-AES128-GCM-SHA256")
+        }
+    }
+}
 
 /// DTLS session information stored after CONNECT handshake
 pub struct DtlsSessionInfo {
@@ -84,17 +129,11 @@ impl DtlsServer {
             .set_private_key_file(key_path, openssl::ssl::SslFiletype::PEM)
             .context("Failed to load DTLS private key")?;
 
-        // Configure cipher list to support both legacy and PSK modes
-        // Include ECDHE-RSA, DHE-RSA, and AES ciphers for AnyConnect compatibility
-        builder.set_cipher_list(
-            "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:\
-             ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256:\
-             DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:\
-             DHE-RSA-AES256-SHA256:DHE-RSA-AES128-SHA256:\
-             AES256-GCM-SHA384:AES128-GCM-SHA256:\
-             AES256-SHA256:AES128-SHA256:AES256-SHA:AES128-SHA:\
-             PSK-AES256-GCM-SHA384:PSK-AES128-GCM-SHA256",
-        )?;
+        // Detect certificate type and configure appropriate cipher suite
+        let cipher_suite = detect_cipher_suite_for_cert(cert_path)
+            .context("Failed to detect cipher suite for certificate")?;
+
+        builder.set_cipher_list(cipher_suite)?;
 
         // Don't verify client certificates
         builder.set_verify(SslVerifyMode::NONE);

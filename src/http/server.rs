@@ -12,6 +12,92 @@ use crate::http::manual_http::{read_request, write_response, HttpRequest, HttpRe
 use crate::http::raw_connect::build_connect_response;
 use crate::vpn::VpnTunnel;
 
+/// Certificate key type for cipher selection
+#[derive(Debug, Clone, PartialEq)]
+enum CertKeyType {
+    Ec,
+    Rsa,
+    Unknown,
+}
+
+/// Detect the public key type of a certificate file
+fn detect_cert_key_type(cert_path: &str) -> CertKeyType {
+    use openssl::pkey::Id;
+    use openssl::x509::X509;
+
+    let cert_pem = match std::fs::read(cert_path) {
+        Ok(data) => data,
+        Err(e) => {
+            warn!("Failed to read certificate for key type detection: {}", e);
+            return CertKeyType::Unknown;
+        }
+    };
+
+    let cert = match X509::from_pem(&cert_pem) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to parse certificate PEM: {}", e);
+            return CertKeyType::Unknown;
+        }
+    };
+
+    let pubkey = match cert.public_key() {
+        Ok(pk) => pk,
+        Err(e) => {
+            warn!("Failed to extract public key: {}", e);
+            return CertKeyType::Unknown;
+        }
+    };
+
+    match pubkey.id() {
+        Id::EC => {
+            debug!("Certificate uses EC (ECDSA) key");
+            CertKeyType::Ec
+        }
+        Id::RSA => {
+            debug!("Certificate uses RSA key");
+            CertKeyType::Rsa
+        }
+        other => {
+            warn!("Unknown certificate key type: {:?}", other);
+            CertKeyType::Unknown
+        }
+    }
+}
+
+/// Select a cipher from the client's list that is compatible with our certificate type
+fn select_compatible_cipher(client_ciphers: &str, cert_type: &CertKeyType) -> String {
+    let ciphers: Vec<&str> = client_ciphers.split(':').collect();
+
+    // Define preferred cipher order based on certificate type
+    let preferred_prefixes = match cert_type {
+        CertKeyType::Ec => vec!["ECDHE-ECDSA-"],
+        CertKeyType::Rsa => vec!["ECDHE-RSA-", "DHE-RSA-"],
+        CertKeyType::Unknown => vec!["ECDHE-ECDSA-", "ECDHE-RSA-", "DHE-RSA-", "AES"],
+    };
+
+    // Find first matching cipher
+    for prefix in &preferred_prefixes {
+        for cipher in &ciphers {
+            if cipher.starts_with(prefix) {
+                info!(
+                    "Selected compatible DTLS cipher: {} (cert type: {:?})",
+                    cipher, cert_type
+                );
+                return cipher.to_string();
+            }
+        }
+    }
+
+    // Fallback: return first cipher from list (may not work, but better than nothing)
+    let fallback = ciphers.first().unwrap_or(&"AES256-GCM-SHA384").to_string();
+    warn!(
+        "No compatible cipher found for {:?} cert, using fallback: {}",
+        cert_type, fallback
+    );
+    fallback
+}
+
 pub struct HttpServer {
     addr: SocketAddr,
     tls_acceptor: TlsAcceptor,
@@ -192,24 +278,25 @@ impl HttpServer {
                                     let session_id_bytes: [u8; 32] = rand::rng().random();
                                     let session_id_hex = hex::encode(&session_id_bytes);
 
-                                    // Select best cipher from client's list
+                                    // Detect certificate type to select compatible cipher
+                                    let cert_type =
+                                        detect_cert_key_type(&state.config.server.cert_path);
+
+                                    // Select best cipher from client's list that is compatible with our cert
                                     // Prefer DTLS 1.2 ciphers if available
-                                    let (selected_cipher, is_dtls12) =
-                                        if let Some(ciphers) = dtls12_ciphersuite {
-                                            // Pick first supported cipher from DTLS12 list
-                                            let first_cipher = ciphers
-                                                .split(':')
-                                                .next()
-                                                .unwrap_or("AES256-GCM-SHA384");
-                                            (first_cipher.to_string(), true)
-                                        } else {
-                                            // Fall back to DTLS 0.9/1.0 ciphers
-                                            let first_cipher = dtls_ciphersuite
-                                                .split(':')
-                                                .next()
-                                                .unwrap_or("AES256-SHA");
-                                            (first_cipher.to_string(), false)
-                                        };
+                                    let (selected_cipher, is_dtls12) = if let Some(ciphers) =
+                                        dtls12_ciphersuite
+                                    {
+                                        // Filter and pick first compatible cipher from DTLS12 list
+                                        let compatible_cipher =
+                                            select_compatible_cipher(ciphers, &cert_type);
+                                        (compatible_cipher, true)
+                                    } else {
+                                        // Fall back to DTLS 0.9/1.0 ciphers
+                                        let compatible_cipher =
+                                            select_compatible_cipher(dtls_ciphersuite, &cert_type);
+                                        (compatible_cipher, false)
+                                    };
 
                                     info!(
                                         "Selected legacy DTLS cipher: {} (DTLS12: {})",
