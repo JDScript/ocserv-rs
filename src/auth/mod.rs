@@ -1,6 +1,8 @@
 pub mod password;
 pub mod provider;
 pub mod session;
+pub mod sso;
+pub mod traits;
 
 pub use password::*;
 pub use provider::*;

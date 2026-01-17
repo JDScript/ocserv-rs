@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
+use crate::auth::sso::oauth2::OAuth2Config;
+
 /// Main configuration structure
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -26,6 +28,9 @@ pub struct ServerConfig {
     pub key_path: String,
     /// DTLS UDP port (optional, default 8443)
     pub dtls_port: Option<u16>,
+    /// Base URL for external access (e.g., "https://vpn.example.com:8443")
+    /// Used for SSO redirect URLs and other external-facing links
+    pub base_url: Option<String>,
 }
 
 /// Authentication configuration
@@ -38,6 +43,9 @@ pub struct AuthConfig {
     /// SAML authentication settings (Phase 4)
     #[serde(default)]
     pub saml: SamlAuthConfig,
+    /// OAuth2 authentication settings
+    #[serde(default)]
+    pub oauth2: OAuth2Config,
 }
 
 /// Password-based authentication configuration
@@ -73,10 +81,6 @@ pub struct SamlAuthConfig {
     pub sp_entity_id: Option<String>,
     /// SP ACS URL (where IdP posts back, e.g. https://vpn.example.com/+CSCOE+/saml/sp/acs)
     pub acs_url: Option<String>,
-
-    /// Base URL for constructing absolute links (e.g. https://vpn.example.com)
-    /// Required for correct AnyConnect behavior
-    pub base_url: Option<String>,
 
     /// Development Mode: Enable built-in Mock IdP at /dev/idp
     #[serde(default)]
@@ -174,6 +178,7 @@ impl Config {
                 cert_path: "server.crt".to_string(),
                 key_path: "server.key".to_string(),
                 dtls_port: Some(8443),
+                base_url: None,
             },
             auth: AuthConfig {
                 banner: Some("Welcome to VPN".to_string()),
@@ -191,6 +196,7 @@ impl Config {
                     ],
                 },
                 saml: SamlAuthConfig::default(),
+                oauth2: OAuth2Config::default(),
             },
             network: NetworkConfig::default(),
             performance: PerformanceConfig::default(),

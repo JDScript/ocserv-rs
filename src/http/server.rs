@@ -409,18 +409,18 @@ async fn handle_http_request(req: &HttpRequest, state: &Arc<ServerState>) -> Htt
 
     let path = req.path.split('?').next().unwrap_or(&req.path);
 
+    // Check SSO provider routes first (dynamic routing)
+    if let Some(sso_provider) = state.auth_manager.sso_provider() {
+        for route in sso_provider.routes() {
+            if req.method == route.method && path == route.path {
+                return sso_provider.handle(req, state);
+            }
+        }
+    }
+
     match (req.method.as_str(), path) {
         // GET requests
         ("GET", "/") | ("GET", "") => auth::handle_auth_init(req, state),
-
-        // SSO: Initiate Login
-        ("GET", "/+CSCOE+/saml/sp/login") => sso::handle_saml_login(req, state),
-
-        // SSO: ACS
-        ("POST", "/+CSCOE+/saml/sp/acs") => sso::handle_saml_acs(req, state),
-
-        // SSO: Final Login Page
-        ("GET", "/+CSCOE+/saml_ac_login.html") => sso::handle_saml_success(req, state),
 
         // Mock IdP (Development only)
         ("GET", "/dev/idp") => {
