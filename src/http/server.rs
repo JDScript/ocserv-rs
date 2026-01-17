@@ -575,13 +575,21 @@ async fn handle_http_request(req: &HttpRequest, state: &Arc<ServerState>) -> Htt
         // POST to / - initial auth request OR auth submission
         ("POST", "/") | ("POST", "") => {
             let content_type = req.header("Content-Type").unwrap_or("");
-            // If it's a form submission (sso-token) or XML auth, handle it
-            // Otherwise treat as init (e.g. empty POST)
-            if content_type.contains("x-www-form-urlencoded") {
-                auth::handle_form_auth(req, state)
-            } else if content_type.contains("xml") {
+            let body_starts_with_xml =
+                req.body.starts_with(b"<?xml") || req.body.starts_with(b"<config-auth");
+
+            // If it's XML content (by header or body inspection), handle as XML auth
+            if content_type.contains("xml") || body_starts_with_xml {
+                debug!(
+                    "POST / - routing to handle_xml_auth (content_type={}, body_xml={})",
+                    content_type, body_starts_with_xml
+                );
                 auth::handle_xml_auth(req, state)
+            } else if content_type.contains("x-www-form-urlencoded") {
+                debug!("POST / - routing to handle_form_auth");
+                auth::handle_form_auth(req, state)
             } else {
+                debug!("POST / - routing to handle_auth_init (no matching content type)");
                 auth::handle_auth_init(req, state)
             }
         }

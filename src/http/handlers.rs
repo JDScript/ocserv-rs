@@ -1,4 +1,4 @@
-use crate::auth::{Authenticator, PasswordAuthenticator, SessionManager};
+use crate::auth::{AuthManager, SessionManager};
 use crate::config::Config;
 use crate::crypto::HpkeContext;
 use crate::vpn::dtls::DtlsSessionStore;
@@ -14,7 +14,7 @@ pub type HpkeStore = Arc<Mutex<HashMap<String, HpkeContext>>>;
 
 /// Server state shared across handlers
 pub struct ServerState {
-    pub authenticator: Arc<dyn Authenticator>,
+    pub auth_manager: Arc<AuthManager>,
     pub session_manager: Arc<SessionManager>,
     pub config: Arc<Config>,
     pub cert_hash: String,
@@ -26,20 +26,15 @@ pub struct ServerState {
 
 impl ServerState {
     pub fn new(config: Arc<Config>, cert_hash: String) -> Self {
-        let authenticator: Arc<dyn Authenticator> = if config.auth.password.enabled {
-            Arc::new(PasswordAuthenticator::new(
-                config.auth.password.users.clone(),
-            ))
-        } else {
-            Arc::new(PasswordAuthenticator::with_defaults())
-        };
+        // Initialize AuthManager from config
+        let auth_manager = Arc::new(AuthManager::from_config(&config.auth));
 
         // Initialize IP Pool from config
         let ip_pool =
             SharedIpPool::new(&config.network.ipv4_pool).expect("Failed to initialize IP pool");
 
         Self {
-            authenticator,
+            auth_manager,
             session_manager: Arc::new(SessionManager::new()),
             config,
             cert_hash,

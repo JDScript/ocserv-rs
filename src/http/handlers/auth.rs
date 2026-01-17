@@ -135,7 +135,8 @@ pub fn handle_auth_init(req: &HttpRequest, state: &Arc<ServerState>) -> HttpResp
 
 /// Handle XML auth submission
 pub fn handle_xml_auth(req: &HttpRequest, state: &Arc<ServerState>) -> HttpResponse {
-    use crate::protocol::dtd::ConfigAuth;
+    use crate::auth::AuthRequest;
+    use crate::protocol::dtd::{ConfigAuth, ConfigAuthType};
 
     let body = String::from_utf8_lossy(&req.body);
     debug!("XML auth submission: {}", body);
@@ -148,6 +149,12 @@ pub fn handle_xml_auth(req: &HttpRequest, state: &Arc<ServerState>) -> HttpRespo
             return HttpResponse::new(400, "Invalid XML");
         }
     };
+
+    // If this is an init request, fallback to handle_auth_init to show login form
+    if config.auth_type == ConfigAuthType::Init {
+        debug!("XML auth is type='init' - falling back to handle_auth_init");
+        return handle_auth_init(req, state);
+    }
 
     // Look for SSO token in any Auth block
     for auth in &config.auth {
@@ -162,60 +169,72 @@ pub fn handle_xml_auth(req: &HttpRequest, state: &Arc<ServerState>) -> HttpRespo
                 );
             } else {
                 warn!("Invalid sso-token provided: {}", token);
+                return HttpResponse::new(401, "Unauthorized")
+                    .header("Content-Type", "text/xml")
+                    .body_str("<error>Invalid SSO token</error>");
             }
         }
     }
 
-    // Check for username/password authentication
+    // Check for username/password authentication using AuthManager
     let username = config.auth.iter().find_map(|a| a.username.clone());
     let password = config.auth.iter().find_map(|a| a.password.clone());
 
     if let (Some(u), Some(p)) = (username, password) {
-        // Validate against config
-        let valid = state
-            .config
-            .auth
-            .password
-            .users
-            .iter()
-            .any(|user| user.username == u && user.password == p);
+        let auth_request = AuthRequest::Password {
+            username: u.clone(),
+            password: p,
+        };
 
-        if valid {
-            info!("Password auth successful for user: {}", u);
-            use crate::auth::UserInfo;
-            use std::collections::HashMap;
-
-            let user_info = UserInfo {
-                username: u,
-                groups: vec![],
-                attributes: HashMap::new(),
-            };
-            let session = state.session_manager.create_session(user_info, None);
-            return create_auth_success_response_for_session(
-                state,
-                &session.session_token,
-                &session.session_id,
-            );
-        } else {
-            warn!("Password auth failed for user: {}", u);
-            return HttpResponse::new(401, "Unauthorized");
+        match state.auth_manager.authenticate(&auth_request) {
+            Ok(user_info) => {
+                info!("Password auth successful for user: {}", user_info.username);
+                let session = state.session_manager.create_session(user_info, None);
+                return create_auth_success_response_for_session(
+                    state,
+                    &session.session_token,
+                    &session.session_id,
+                );
+            }
+            Err(e) => {
+                warn!("Password auth failed for user {}: {}", u, e);
+                return HttpResponse::new(401, "Unauthorized")
+                    .header("Content-Type", "text/xml")
+                    .body_str("<error>Invalid credentials</error>");
+            }
         }
     }
 
-    // Default: Fallback to creating a new mock session (legacy behavior for non-SAML)
-    // ONLY if no auth header present and purely testing?
-    // Secure by default: Reject
-    warn!("No valid auth method found in XML submission");
+    // No valid auth method found (for auth-reply without credentials)
+    warn!(
+        "No valid auth method found in XML submission (type={:?})",
+        config.auth_type
+    );
     HttpResponse::new(401, "Unauthorized")
+        .header("Content-Type", "text/xml")
+        .body_str("<error>No credentials provided</error>")
 }
 
 /// Handle form auth submission
 pub fn handle_form_auth(req: &HttpRequest, state: &Arc<ServerState>) -> HttpResponse {
-    let form_data = req.parse_form();
-    debug!("Form auth submission: {:?}", form_data);
+    use crate::auth::AuthRequest;
 
+    let form_data = req.parse_form();
+    info!(
+        "Form auth submission - keys: {:?}",
+        form_data.keys().collect::<Vec<_>>()
+    );
+
+    // Log the raw body for debugging
+    let body_str = String::from_utf8_lossy(&req.body);
+    debug!(
+        "Form auth raw body (first 200 chars): {}",
+        &body_str[..body_str.len().min(200)]
+    );
+
+    // Check for SSO token first
     if let Some(token) = form_data.get("sso-token") {
-        info!("Found sso-token in form: {}", token);
+        info!("Found sso-token in form data: {}", token);
         if let Some(session) = state.session_manager.get_session_by_token(token) {
             info!("Valid session found for sso-token: {}", session.session_id);
             return create_auth_success_response_for_session(
@@ -224,51 +243,64 @@ pub fn handle_form_auth(req: &HttpRequest, state: &Arc<ServerState>) -> HttpResp
                 &session.session_id,
             );
         } else {
-            warn!("Invalid sso-token provided in form: {}", token);
+            warn!(
+                "Invalid sso-token provided in form: {} - not found in session manager",
+                token
+            );
+            return HttpResponse::new(401, "Unauthorized")
+                .header("Content-Type", "text/xml")
+                .body_str("<error>Invalid SSO token</error>");
         }
+    } else {
+        debug!("No sso-token found in form data");
     }
 
-    // Check for username/password authentication in form data
+    // Check for username/password authentication using AuthManager
     let username = form_data.get("username").map(|s| s.to_string());
     let password = form_data.get("password").map(|s| s.to_string());
 
-    if let (Some(u), Some(p)) = (username, password) {
-        // Validate against config
-        let valid = state
-            .config
-            .auth
-            .password
-            .users
-            .iter()
-            .any(|user| user.username == u && user.password == p);
+    // If credentials were provided, attempt authentication
+    if let (Some(u), Some(p)) = (username.clone(), password) {
+        let auth_request = AuthRequest::Password {
+            username: u.clone(),
+            password: p,
+        };
 
-        if valid {
-            info!("Password auth successful (form) for user: {}", u);
-            use crate::auth::UserInfo;
-            use std::collections::HashMap;
-
-            let user_info = UserInfo {
-                username: u,
-                groups: vec![],
-                attributes: HashMap::new(),
-            };
-            let session = state.session_manager.create_session(user_info, None);
-            return create_auth_success_response_for_session(
-                state,
-                &session.session_token,
-                &session.session_id,
-            );
-        } else {
-            warn!("Password auth failed (form) for user: {}", u);
-            return HttpResponse::new(401, "Unauthorized");
+        match state.auth_manager.authenticate(&auth_request) {
+            Ok(user_info) => {
+                info!(
+                    "Password auth successful (form) for user: {}",
+                    user_info.username
+                );
+                let session = state.session_manager.create_session(user_info, None);
+                return create_auth_success_response_for_session(
+                    state,
+                    &session.session_token,
+                    &session.session_id,
+                );
+            }
+            Err(e) => {
+                // Credentials were provided but invalid - return 401
+                warn!("Password auth failed (form) for user {}: {}", u, e);
+                return HttpResponse::new(401, "Unauthorized")
+                    .header("Content-Type", "text/xml")
+                    .body_str("<error>Invalid credentials</error>");
+            }
         }
     }
 
-    // Default: If no valid auth found, assume it might be an init request (misrouted)
-    // or a failed auth. Fallback to init handler to show the form.
-    // DO NOT return success here!
-    warn!("No valid auth in form data - falling back to auth init");
-    handle_auth_init(req, state)
+    // No credentials provided - this is likely an init request
+    // Fallback to auth init to show the login form
+    if username.is_none() && form_data.get("password").is_none() {
+        debug!("No credentials in form data - treating as init request");
+        return handle_auth_init(req, state);
+    }
+
+    // Partial credentials (username but no password, or vice versa) - return 401
+    warn!("Incomplete credentials in form data");
+    HttpResponse::new(401, "Unauthorized")
+        .header("Content-Type", "text/xml")
+        .body_str("<error>Incomplete credentials</error>")
 }
 
 fn create_auth_success_response_for_session(
@@ -294,22 +326,26 @@ fn create_auth_success_response_for_session(
         &json!({
             "banner": state.config.auth.banner.as_deref().unwrap_or("Welcome to AI4CE VPN"),
             "session_id": session_id,
-            "session_token": session_token
+            "session_token": session_token,
+            "cert_hash": state.cert_hash.to_uppercase()
         }),
     ) {
         Ok(x) => x,
         Err(e) => return HttpResponse::new(500, &format!("Template Error: {}", e)),
     };
 
-    HttpResponse::ok()
+    let mut response = HttpResponse::ok()
         .header("Connection", "Keep-Alive")
         .header("Content-Type", "text/xml")
-        .header("X-Transcend-Version", "1")
+        .header("X-Transcend-Version", "1");
+
+    response = response
         .header("Set-Cookie", &webvpncontext)
         .header("Set-Cookie", &webvpn)
         .header("Set-Cookie", &webvpnc_clear)
-        .header("Set-Cookie", &webvpnc_set)
-        .body_str(&xml)
+        .header("Set-Cookie", &webvpnc_set);
+
+    response.body_str(&xml)
 }
 
 /// Build SSO initiation form XML using tera template

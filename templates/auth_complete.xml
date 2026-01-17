@@ -1,9 +1,19 @@
-<config-auth client="vpn" type="complete">
+<config-auth client="vpn" type="complete" aggregate-auth-version="2">
     <version who="sg">0.1(1)</version>
+    <session-id>{{ session_id }}</session-id>
+    <session-token>{{ session_token }}</session-token>
     <auth id="success">
         <title>SSL VPN Service</title>
         <banner>{{ banner }}</banner>
     </auth>
+    <capabilities>
+        <crypto-supported>ssl-dhe</crypto-supported>
+    </capabilities>
+    <config client="vpn" type="private">
+        <vpn-base-config>
+            <server-cert-hash>{{ cert_hash }}</server-cert-hash>
+        </vpn-base-config>
+    </config>
 </config-auth>
 
 

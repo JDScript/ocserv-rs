@@ -1,7 +1,9 @@
 pub mod password;
+pub mod provider;
 pub mod session;
 
 pub use password::*;
+pub use provider::*;
 pub use session::*;
 
 use anyhow::Result;
