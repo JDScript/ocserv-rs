@@ -1,12 +1,16 @@
 use crate::auth::{Authenticator, PasswordAuthenticator, SessionManager};
 use crate::config::Config;
+use crate::crypto::HpkeContext;
 use crate::vpn::dtls::DtlsSessionStore;
 use crate::vpn::ip_pool::SharedIpPool;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 pub mod auth;
 pub mod sso;
+
+/// HPKE context storage (keyed by session token)
+pub type HpkeStore = Arc<Mutex<HashMap<String, HpkeContext>>>;
 
 /// Server state shared across handlers
 pub struct ServerState {
@@ -16,6 +20,8 @@ pub struct ServerState {
     pub cert_hash: String,
     pub dtls_sessions: DtlsSessionStore,
     pub ip_pool: SharedIpPool,
+    /// HPKE contexts for SSO token encryption (keyed by pending SSO session ID)
+    pub hpke_contexts: HpkeStore,
 }
 
 impl ServerState {
@@ -39,6 +45,20 @@ impl ServerState {
             cert_hash,
             dtls_sessions: Arc::new(RwLock::new(HashMap::new())),
             ip_pool,
+            hpke_contexts: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Store HPKE context for a pending SSO session
+    pub fn store_hpke_context(&self, session_key: &str, ctx: HpkeContext) {
+        self.hpke_contexts
+            .lock()
+            .unwrap()
+            .insert(session_key.to_string(), ctx);
+    }
+
+    /// Get HPKE context for encryption (clones the context)
+    pub fn get_hpke_context(&self, session_key: &str) -> Option<HpkeContext> {
+        self.hpke_contexts.lock().unwrap().get(session_key).cloned()
     }
 }

@@ -38,8 +38,23 @@ pub fn compress_and_encode_authn_request(xml: &str) -> Result<String> {
 }
 
 /// Handle SAML Login Request (Redirect to IdP)
-pub fn handle_saml_login(_req: &HttpRequest, state: &Arc<ServerState>) -> HttpResponse {
+/// Handle SAML Login Request (Redirect to IdP)
+pub fn handle_saml_login(req: &HttpRequest, state: &Arc<ServerState>) -> HttpResponse {
     info!("Handling SAML Login request");
+
+    // Extract 'ctx' from query parameters if present
+    // This comes from auth.rs SSO URL construction: /+CSCOE+/saml/sp/login?ctx=<hpke_ctx_id>
+    let ctx = req
+        .path
+        .split('?')
+        .nth(1)
+        .and_then(|q| q.split('&').find(|p| p.starts_with("ctx=")))
+        .and_then(|p| p.split('=').nth(1))
+        .map(|s| s.to_string());
+
+    if let Some(ref c) = ctx {
+        info!("SAML Login: Preserving ctx={} in RelayState", c);
+    }
 
     // 1. Get Config
     let idp_metadata_url = match state.config.auth.saml.idp_metadata_url.as_ref() {
@@ -87,8 +102,12 @@ pub fn handle_saml_login(_req: &HttpRequest, state: &Arc<ServerState>) -> HttpRe
     url.query_pairs_mut()
         .append_pair("SAMLRequest", &compressed_encoded);
 
-    // Add RelayState if provided in query params of original request?
-    // Not strictly needed for basic flow, but good practice.
+    // Add RelayState if present (to pass ctx back to ACS)
+    if let Some(c) = ctx {
+        // We pass "ctx=<value>" as RelayState
+        url.query_pairs_mut()
+            .append_pair("RelayState", &format!("ctx={}", c));
+    }
 
     HttpResponse::new(302, "Found")
         .header("Location", url.to_string().as_str())
@@ -112,16 +131,39 @@ pub fn handle_saml_acs(req: &HttpRequest, state: &Arc<ServerState>) -> HttpRespo
     // 2. Validate Response (MOCK for now, as in old code phase 4)
     // TODO: Implement real XML signature validation using openssl/samael
 
-    // 3. Create Session
+    // 3. Extract HPKE Context ID from RelayState
+    // RelayState is passed by us in handle_saml_login, echoed by IdP
+    let relay_state = match form_data.get("RelayState") {
+        Some(s) => s,
+        None => "",
+    };
+
+    // Parse ctx=... from RelayState
+    let hpke_ctx_id = if !relay_state.is_empty() {
+        // Expected format: "ctx=<uuid>" or "ctx=<uuid>&..."
+        // Or sometimes just stored as URL encoded.
+        // We set it as "ctx=<uuid>" in handle_saml_login (to be implemented)
+        url::form_urlencoded::parse(relay_state.as_bytes())
+            .find(|(k, _)| k == "ctx")
+            .map(|(_, v)| v.to_string())
+    } else {
+        None
+    };
+
+    if let Some(ref id) = hpke_ctx_id {
+        info!("SAML ACS: Found HPKE Context ID from RelayState: {}", id);
+    }
+
+    // 4. Create Session (bind HPKE context to session)
     let user_info = UserInfo {
         username: "saml_user".to_string(), // Placeholder
         groups: vec!["saml_users".to_string()],
         attributes: HashMap::new(),
     };
 
-    let session = state.session_manager.create_session(user_info);
+    let session = state.session_manager.create_session(user_info, hpke_ctx_id);
 
-    // 4. Set Cookie and Redirect to Final Page
+    // 5. Set Cookie and Redirect to Final Page
     // Cookie name must match <sso-v2-token-cookie-name> if specified, or we use our standard `acSamlv2Token`
     // The client expects a specific cookie set by the browser which the client then reads.
 
@@ -160,7 +202,12 @@ pub fn handle_mock_idp_get(req: &HttpRequest, _state: &Arc<ServerState>) -> Http
         .nth(1)
         .and_then(|q| q.split('&').find(|p| p.starts_with("RelayState=")))
         .and_then(|p| p.split('=').nth(1))
-        .unwrap_or("");
+        .map(|s| {
+            urlencoding::decode(s)
+                .unwrap_or(std::borrow::Cow::Borrowed(s))
+                .to_string()
+        })
+        .unwrap_or_default();
 
     let html = match render_template(
         "mock_idp_login.html",
@@ -179,8 +226,12 @@ pub fn handle_mock_idp_get(req: &HttpRequest, _state: &Arc<ServerState>) -> Http
 }
 
 /// Handle Mock IdP POST (Login Form Submission)
-pub fn handle_mock_idp_post(_req: &HttpRequest, state: &Arc<ServerState>) -> HttpResponse {
+pub fn handle_mock_idp_post(req: &HttpRequest, state: &Arc<ServerState>) -> HttpResponse {
     info!("Mock IdP POST: Generating dummy SAMLResponse");
+
+    // Parse form data to get RelayState
+    let form_data = req.parse_form();
+    let relay_state = form_data.get("RelayState").cloned().unwrap_or_default();
 
     let acs_url = state
         .config
@@ -201,6 +252,13 @@ pub fn handle_mock_idp_post(_req: &HttpRequest, state: &Arc<ServerState>) -> Htt
         "<input type=\"hidden\" name=\"SAMLResponse\" value=\"{}\"/>",
         dummy_response
     ));
+    // Include RelayState if present
+    if !relay_state.is_empty() {
+        html.push_str(&format!(
+            "<input type=\"hidden\" name=\"RelayState\" value=\"{}\"/>",
+            relay_state
+        ));
+    }
     html.push_str("</form></body></html>");
 
     HttpResponse::ok()
@@ -209,11 +267,9 @@ pub fn handle_mock_idp_post(_req: &HttpRequest, state: &Arc<ServerState>) -> Htt
 }
 
 /// Handle SAML success page (Final step, opens AnyConnect app)
-pub fn handle_saml_success(req: &HttpRequest, _state: &Arc<ServerState>) -> HttpResponse {
+pub fn handle_saml_success(req: &HttpRequest, state: &Arc<ServerState>) -> HttpResponse {
     info!("Handling SAML Success page");
 
-    // We can try to extract the token from the cookie to pass it to the template
-    // although the template JS also does this.
     let token = req
         .headers
         .iter()
@@ -223,12 +279,48 @@ pub fn handle_saml_success(req: &HttpRequest, _state: &Arc<ServerState>) -> Http
                 .find(|p| p.trim().starts_with("acSamlv2Token="))
                 .and_then(|p| p.split('=').nth(1))
         })
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string(); // Clone to own string
+
+    let mut final_token = token.clone();
+
+    // Check if session has HPKE context associated
+    if let Some(session) = state.session_manager.get_session_by_token(&token) {
+        if let Some(ref hpke_id) = session.hpke_ctx_id {
+            info!(
+                "Session {} has HPKE context ID: {}",
+                session.session_id, hpke_id
+            );
+            // Retrieve HPKE context (cloned) so we can encrypt
+            if let Some(ctx) = state.get_hpke_context(hpke_id) {
+                // If this is a repeat request (e.g. valid session), we re-encrypt?
+                // AnyConnect might hit this URL multiple times.
+                // HPKE context isn't single use in our implementation (ephemeral key is generated per encrypt call)
+                // BUT we need to ensure we don't rotate keys if that matters?
+                // Actually, our encrypt_token generates NEW ephemeral keys each time.
+                // This is fine as long as client accepts any matching message.
+
+                info!("Encrypting token for legacy AnyConnect client...");
+                match ctx.encrypt_token(&token) {
+                    Ok(encrypted) => {
+                        info!("Token encrypted successfully (len={})", encrypted.len());
+                        final_token = encrypted;
+                    }
+                    Err(e) => warn!("HPKE encryption failed: {}", e),
+                }
+            } else {
+                warn!(
+                    "HPKE context ID {} found but context missing from store (expired?)",
+                    hpke_id
+                );
+            }
+        }
+    }
 
     let html = match render_template(
-        "sso_success.html",
+        "saml_ac_login.html", // Using real AnyConnect template
         &json!({
-            "token": token
+            "AC_SAML_TOKEN": final_token // Token variable expected by template
         }),
     ) {
         Ok(h) => h,
@@ -236,7 +328,9 @@ pub fn handle_saml_success(req: &HttpRequest, _state: &Arc<ServerState>) -> Http
     };
 
     HttpResponse::ok()
-        .header("Content-Type", "text/html")
+        .header("Content-Type", "text/html; charset=utf-8")
         .header("Cache-Control", "no-store")
+        .header("Pragma", "no-cache")
+        .header("X-Frame-Options", "SAMEORIGIN")
         .body_str(&html)
 }

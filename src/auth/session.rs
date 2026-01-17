@@ -8,6 +8,7 @@ use super::UserInfo;
 pub struct VpnSession {
     pub session_id: String,
     pub session_token: String,
+    pub hpke_ctx_id: Option<String>, // ID to lookup HPKE context for encryption
     pub user_info: UserInfo,
     pub created_at: std::time::Instant,
 }
@@ -25,13 +26,14 @@ impl SessionManager {
     }
 
     /// Create a new session for authenticated user
-    pub fn create_session(&self, user_info: UserInfo) -> VpnSession {
+    pub fn create_session(&self, user_info: UserInfo, hpke_ctx_id: Option<String>) -> VpnSession {
         let session_id = rand::random::<u32>().to_string();
         let session_token = self.generate_session_token(&session_id, &user_info.username);
 
         let session = VpnSession {
             session_id: session_id.clone(),
             session_token,
+            hpke_ctx_id,
             user_info,
             created_at: std::time::Instant::now(),
         };
@@ -64,20 +66,14 @@ impl SessionManager {
 
     /// Generate session token in AnyConnect format
     /// Format: <random_hex>@<session_id>@<random_hex>@<hash>
-    fn generate_session_token(&self, session_id: &str, username: &str) -> String {
-        let r1 = format!("{:X}", rand::random::<u32>() & 0xFFFFFF);
-        let r2 = format!("{:X}", rand::random::<u16>());
-
-        // Generate hash (simplified - in production use proper HMAC)
-        let hash_input = format!("{}{}", session_id, username);
-        let hash = format!(
-            "{:X}",
-            hash_input
-                .bytes()
-                .fold(0u64, |acc, b| acc.wrapping_add(b as u64))
-        );
-
-        format!("{}@{}@{}@{}", r1, session_id, r2, hash)
+    fn generate_session_token(&self, _session_id: &str, _username: &str) -> String {
+        // OpenConnect/AnyConnect HPKE implementation requires the decrypted token to be alphanumeric.
+        // We generate a random 64-character hex string (256 bits of entropy).
+        // This replaces the legacy @-separated format.
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        hex::encode(bytes).to_uppercase()
     }
 }
 
@@ -100,10 +96,11 @@ mod tests {
             attributes: HashMap::new(),
         };
 
-        let session = manager.create_session(user_info);
+        let session = manager.create_session(user_info, None);
         assert!(!session.session_id.is_empty());
         assert!(!session.session_token.is_empty());
-        assert!(session.session_token.contains(&session.session_id));
+        // New token format is just random hex, doesn't necessarily contain session_id
+        assert_eq!(session.session_token.len(), 64);
     }
 
     #[test]
@@ -115,7 +112,7 @@ mod tests {
             attributes: HashMap::new(),
         };
 
-        let session = manager.create_session(user_info);
+        let session = manager.create_session(user_info, None);
         let retrieved = manager.get_session(&session.session_id);
 
         assert!(retrieved.is_some());

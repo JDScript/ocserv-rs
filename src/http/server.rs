@@ -300,6 +300,9 @@ impl HttpServer {
                                     }
                                 };
 
+                                // Configure routing and NAT
+                                tun.configure_routing();
+
                                 // Extract DTLS session ID if DTLS is configured
                                 let dtls_session_id = match &dtls_config {
                                     Some(DtlsConfig::Psk(p)) => Some(p.app_id.clone()),
@@ -482,8 +485,19 @@ async fn handle_http_request(req: &HttpRequest, state: &Arc<ServerState>) -> Htt
                 .body_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<logout><result>success</result></logout>")
         }
 
-        // POST to / - initial auth request
-        ("POST", "/") | ("POST", "") => auth::handle_auth_init(req, state),
+        // POST to / - initial auth request OR auth submission
+        ("POST", "/") | ("POST", "") => {
+            let content_type = req.header("Content-Type").unwrap_or("");
+            // If it's a form submission (sso-token) or XML auth, handle it
+            // Otherwise treat as init (e.g. empty POST)
+            if content_type.contains("x-www-form-urlencoded") {
+                auth::handle_form_auth(req, state)
+            } else if content_type.contains("xml") {
+                auth::handle_xml_auth(req, state)
+            } else {
+                auth::handle_auth_init(req, state)
+            }
+        }
 
         // POST to /auth
         ("POST", "/auth") => {

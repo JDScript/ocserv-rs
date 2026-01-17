@@ -57,8 +57,42 @@ pub fn handle_auth_init(req: &HttpRequest, state: &Arc<ServerState>) -> HttpResp
     // SSO Check
     if state.config.auth.saml.enabled {
         let base_url = state.config.auth.saml.base_url.as_deref().unwrap_or("");
-        let sso_login_url = format!("{}/+CSCOE+/saml/sp/login", base_url);
+        let mut sso_login_url = format!("{}/+CSCOE+/saml/sp/login", base_url);
         let sso_login_final_url = format!("{}/+CSCOE+/saml_ac_login.html", base_url);
+
+        // Extract AnyConnect version (simplified)
+        let user_agent = req.header("User-Agent").unwrap_or("");
+        let acvers = if let Some(idx) = user_agent.find("AnyConnect") {
+            user_agent[idx..]
+                .split_whitespace()
+                .nth(2)
+                .unwrap_or("5.0.0")
+        } else {
+            "5.0.0"
+        };
+
+        // Debug Headers
+        for (k, v) in &req.headers {
+            debug!("Header: {} = {}", k, v);
+        }
+
+        // Check for STRAP-DH-Pubkey for HPKE match
+        if let Some(strap_dh_pubkey) = req.header("X-AnyConnect-STRAP-DH-Pubkey") {
+            info!("Got X-AnyConnect-STRAP-DH-Pubkey, setting up HPKE context");
+            let mut hpke_ctx = crate::crypto::HpkeContext::new();
+            if let Err(e) = hpke_ctx.set_client_dh_pubkey(strap_dh_pubkey) {
+                warn!("Failed to parse STRAP-DH-Pubkey: {}", e);
+            } else {
+                // Generate unique HPKE Context ID
+                let ctx_id = uuid::Uuid::new_v4().to_string();
+                state.store_hpke_context(&ctx_id, hpke_ctx);
+                info!("Stored HPKE context with ID: {}", ctx_id);
+
+                // Append ctx to SSO URL
+                sso_login_url = format!("{}?ctx={}", sso_login_url, ctx_id);
+                info!("Updated SSO URL with ctx: {}", sso_login_url);
+            }
+        }
 
         info!("SAML enabled - responding with SSO initiation form");
         return HttpResponse::ok()
@@ -69,6 +103,7 @@ pub fn handle_auth_init(req: &HttpRequest, state: &Arc<ServerState>) -> HttpResp
                 "Set-Cookie",
                 "webvpncontext=; expires=Thu, 01 Jan 1970 22:00:00 GMT; path=/; Secure; HttpOnly",
             )
+            .header("Set-Cookie", &format!("acvers={}; path=/; Secure", acvers))
             .body_str(&build_sso_form_xml(
                 state,
                 &sso_login_url,
@@ -131,8 +166,47 @@ pub fn handle_xml_auth(req: &HttpRequest, state: &Arc<ServerState>) -> HttpRespo
         }
     }
 
+    // Check for username/password authentication
+    let username = config.auth.iter().find_map(|a| a.username.clone());
+    let password = config.auth.iter().find_map(|a| a.password.clone());
+
+    if let (Some(u), Some(p)) = (username, password) {
+        // Validate against config
+        let valid = state
+            .config
+            .auth
+            .password
+            .users
+            .iter()
+            .any(|user| user.username == u && user.password == p);
+
+        if valid {
+            info!("Password auth successful for user: {}", u);
+            use crate::auth::UserInfo;
+            use std::collections::HashMap;
+
+            let user_info = UserInfo {
+                username: u,
+                groups: vec![],
+                attributes: HashMap::new(),
+            };
+            let session = state.session_manager.create_session(user_info, None);
+            return create_auth_success_response_for_session(
+                state,
+                &session.session_token,
+                &session.session_id,
+            );
+        } else {
+            warn!("Password auth failed for user: {}", u);
+            return HttpResponse::new(401, "Unauthorized");
+        }
+    }
+
     // Default: Fallback to creating a new mock session (legacy behavior for non-SAML)
-    create_auth_success_response(state)
+    // ONLY if no auth header present and purely testing?
+    // Secure by default: Reject
+    warn!("No valid auth method found in XML submission");
+    HttpResponse::new(401, "Unauthorized")
 }
 
 /// Handle form auth submission
@@ -154,20 +228,47 @@ pub fn handle_form_auth(req: &HttpRequest, state: &Arc<ServerState>) -> HttpResp
         }
     }
 
-    create_auth_success_response(state)
-}
+    // Check for username/password authentication in form data
+    let username = form_data.get("username").map(|s| s.to_string());
+    let password = form_data.get("password").map(|s| s.to_string());
 
-fn create_auth_success_response(state: &Arc<ServerState>) -> HttpResponse {
-    use crate::auth::UserInfo;
-    use std::collections::HashMap;
+    if let (Some(u), Some(p)) = (username, password) {
+        // Validate against config
+        let valid = state
+            .config
+            .auth
+            .password
+            .users
+            .iter()
+            .any(|user| user.username == u && user.password == p);
 
-    let user_info = UserInfo {
-        username: "user".to_string(),
-        groups: vec![],
-        attributes: HashMap::new(),
-    };
-    let session = state.session_manager.create_session(user_info);
-    create_auth_success_response_for_session(state, &session.session_token, &session.session_id)
+        if valid {
+            info!("Password auth successful (form) for user: {}", u);
+            use crate::auth::UserInfo;
+            use std::collections::HashMap;
+
+            let user_info = UserInfo {
+                username: u,
+                groups: vec![],
+                attributes: HashMap::new(),
+            };
+            let session = state.session_manager.create_session(user_info, None);
+            return create_auth_success_response_for_session(
+                state,
+                &session.session_token,
+                &session.session_id,
+            );
+        } else {
+            warn!("Password auth failed (form) for user: {}", u);
+            return HttpResponse::new(401, "Unauthorized");
+        }
+    }
+
+    // Default: If no valid auth found, assume it might be an init request (misrouted)
+    // or a failed auth. Fallback to init handler to show the form.
+    // DO NOT return success here!
+    warn!("No valid auth in form data - falling back to auth init");
+    handle_auth_init(req, state)
 }
 
 fn create_auth_success_response_for_session(
