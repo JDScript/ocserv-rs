@@ -10,6 +10,9 @@ pub struct Config {
     /// Network Configuration (Phase 5)
     #[serde(default)]
     pub network: NetworkConfig,
+    /// Performance tuning
+    #[serde(default)]
+    pub performance: PerformanceConfig,
 }
 
 /// Server configuration
@@ -114,6 +117,34 @@ impl Default for NetworkConfig {
     }
 }
 
+/// Performance tuning configuration
+#[derive(Debug, Deserialize, Clone)]
+pub struct PerformanceConfig {
+    /// Buffer size for TUN/DTLS reads (default: 65535)
+    #[serde(default = "default_buffer_size")]
+    pub buffer_size: usize,
+    /// Channel capacity for packet queues (default: 256)
+    #[serde(default = "default_channel_capacity")]
+    pub channel_capacity: usize,
+}
+
+impl Default for PerformanceConfig {
+    fn default() -> Self {
+        Self {
+            buffer_size: default_buffer_size(),
+            channel_capacity: default_channel_capacity(),
+        }
+    }
+}
+
+fn default_buffer_size() -> usize {
+    65535
+}
+
+fn default_channel_capacity() -> usize {
+    256
+}
+
 fn default_ipv4_pool() -> String {
     "10.10.0.0/24".to_string()
 }
@@ -162,6 +193,7 @@ impl Config {
                 saml: SamlAuthConfig::default(),
             },
             network: NetworkConfig::default(),
+            performance: PerformanceConfig::default(),
         }
     }
 }

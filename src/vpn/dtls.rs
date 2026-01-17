@@ -47,6 +47,9 @@ pub struct DtlsServer {
     active_sessions: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>,
     /// Map of ssl_ptr -> session_id (populated before handshake)
     pending_session_ids: Arc<RwLock<HashMap<usize, String>>>,
+    // Configurable performance parameters
+    buffer_size: usize,
+    channel_capacity: usize,
 }
 
 impl DtlsServer {
@@ -56,6 +59,8 @@ impl DtlsServer {
         sessions: DtlsSessionStore,
         cert_path: &str,
         key_path: &str,
+        buffer_size: usize,
+        channel_capacity: usize,
     ) -> Result<Self> {
         let bind_addr = format!("0.0.0.0:{}", port);
         let socket = UdpSocket::bind(&bind_addr)
@@ -137,12 +142,15 @@ impl DtlsServer {
             sessions,
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             pending_session_ids: pending_ids,
+            buffer_size,
+            channel_capacity,
         })
     }
 
     /// Run the DTLS server main loop
     pub async fn run(self) -> Result<()> {
-        let mut buf = [0u8; 4096];
+        // Use configurable buffer size
+        let mut buf = vec![0u8; self.buffer_size];
 
         loop {
             // Receive UDP packet
@@ -156,13 +164,16 @@ impl DtlsServer {
             };
 
             if has_session {
-                // Forward to existing session
+                // Forward to existing session (non-blocking)
                 let tx = {
                     let sessions = self.active_sessions.read().unwrap();
                     sessions.get(&addr).cloned()
                 };
                 if let Some(tx) = tx {
-                    let _ = tx.send(packet).await;
+                    // Use try_send to avoid blocking - drop packet if channel full
+                    if tx.try_send(packet).is_err() {
+                        debug!("DTLS session queue full, dropping packet");
+                    }
                 }
             } else {
                 // New session - try to extract session_id from ClientHello
@@ -178,8 +189,8 @@ impl DtlsServer {
                     };
 
                     if has_psk {
-                        // Create channel for this session
-                        let (tx, rx) = mpsc::channel::<Bytes>(100);
+                        // Create channel for this session with configurable capacity
+                        let (tx, rx) = mpsc::channel::<Bytes>(self.channel_capacity);
 
                         // Store in active sessions
                         {

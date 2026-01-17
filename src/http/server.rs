@@ -57,6 +57,8 @@ impl HttpServer {
                     dtls_sessions,
                     &cert_path,
                     &key_path,
+                    self.config.performance.buffer_size,
+                    self.config.performance.channel_capacity,
                 )
                 .await
                 {
@@ -276,8 +278,9 @@ impl HttpServer {
 
                                         // Create channel for DTLS packets if DTLS is enabled
                                         let tunnel = if let Some(session_id) = dtls_session_id {
-                                            let (dtls_tx, dtls_rx) =
-                                                mpsc::channel::<bytes::Bytes>(100);
+                                            let (dtls_tx, dtls_rx) = mpsc::channel::<bytes::Bytes>(
+                                                state.config.performance.channel_capacity,
+                                            );
 
                                             // Update DTLS session with the tun_tx channel
                                             {
@@ -297,9 +300,20 @@ impl HttpServer {
                                                 }
                                             }
 
-                                            VpnTunnel::with_dtls(tls_stream, tun, dtls_rx)
+                                            VpnTunnel::with_dtls(
+                                                tls_stream,
+                                                tun,
+                                                dtls_rx,
+                                                state.config.performance.buffer_size,
+                                                state.config.performance.channel_capacity,
+                                            )
                                         } else {
-                                            VpnTunnel::new(tls_stream, tun)
+                                            VpnTunnel::new(
+                                                tls_stream,
+                                                tun,
+                                                state.config.performance.buffer_size,
+                                                state.config.performance.channel_capacity,
+                                            )
                                         };
 
                                         if let Err(e) = tunnel.run().await {

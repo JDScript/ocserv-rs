@@ -11,26 +11,39 @@ pub struct VpnTunnel<IO> {
     tun: TunDevice,
     /// Optional receiver for DTLS packets to write to TUN
     dtls_rx: Option<mpsc::Receiver<Bytes>>,
+    // Configurable performance parameters
+    buffer_size: usize,
+    channel_capacity: usize,
 }
 
 impl<IO> VpnTunnel<IO>
 where
     IO: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
-    pub fn new(io: IO, tun: TunDevice) -> Self {
+    pub fn new(io: IO, tun: TunDevice, buffer_size: usize, channel_capacity: usize) -> Self {
         Self {
             io,
             tun,
             dtls_rx: None,
+            buffer_size,
+            channel_capacity,
         }
     }
 
     /// Create a new tunnel with DTLS support
-    pub fn with_dtls(io: IO, tun: TunDevice, dtls_rx: mpsc::Receiver<Bytes>) -> Self {
+    pub fn with_dtls(
+        io: IO,
+        tun: TunDevice,
+        dtls_rx: mpsc::Receiver<Bytes>,
+        buffer_size: usize,
+        channel_capacity: usize,
+    ) -> Self {
         Self {
             io,
             tun,
             dtls_rx: Some(dtls_rx),
+            buffer_size,
+            channel_capacity,
         }
     }
 
@@ -41,7 +54,8 @@ where
         let (mut tun_r, mut tun_w) = self.tun.split();
 
         // Channel for writing to TLS (Data from TUN + Control replies from Reader)
-        let (tx_sender, mut tx_receiver) = mpsc::channel::<Bytes>(100);
+        // Use larger capacity to reduce backpressure
+        let (tx_sender, mut tx_receiver) = mpsc::channel::<Bytes>(self.channel_capacity);
 
         // 1. TLS Writer Task: Receives packets from channel and writes to TLS stream
         let tls_writer_handle = tokio::spawn(async move {
@@ -59,7 +73,8 @@ where
         let tx_sender_tun = tx_sender.clone();
         let tun_reader_handle = tokio::spawn(async move {
             info!("TUN Reader task started");
-            let mut buf = vec![0u8; 2048]; // MTU is usually ~1400
+            // Use larger buffer for potential jumbo frames and efficiency
+            let mut buf = vec![0u8; self.buffer_size];
             loop {
                 match tun_r.read(&mut buf).await {
                     Ok(n) => {
@@ -86,7 +101,7 @@ where
 
         // 2b. DTLS Reader Task: Reads decapsulated IP packets from DTLS, writes to TUN
         // Create a channel for TUN writes shared between TLS reader and DTLS reader
-        let (tun_write_tx, mut tun_write_rx) = mpsc::channel::<Bytes>(100);
+        let (tun_write_tx, mut tun_write_rx) = mpsc::channel::<Bytes>(self.channel_capacity);
 
         // Spawn TUN write task
         let tun_writer_handle = tokio::spawn(async move {
