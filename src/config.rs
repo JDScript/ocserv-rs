@@ -15,6 +15,9 @@ pub struct Config {
     /// Performance tuning
     #[serde(default)]
     pub performance: PerformanceConfig,
+    /// Control interface configuration
+    #[serde(default)]
+    pub control: ControlConfig,
 }
 
 /// Server configuration
@@ -141,6 +144,29 @@ impl Default for PerformanceConfig {
     }
 }
 
+/// Control socket configuration
+#[derive(Debug, Deserialize, Clone)]
+pub struct ControlConfig {
+    /// Socket path (default: /var/run/ocserv-rs.sock)
+    #[serde(default = "default_socket_path")]
+    pub socket_path: String,
+    /// Socket group ownership (optional)
+    pub socket_group: Option<String>,
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: default_socket_path(),
+            socket_group: None,
+        }
+    }
+}
+
+fn default_socket_path() -> String {
+    "/var/run/ocserv-rs.sock".to_string()
+}
+
 fn default_buffer_size() -> usize {
     65535
 }
@@ -200,6 +226,7 @@ impl Config {
             },
             network: NetworkConfig::default(),
             performance: PerformanceConfig::default(),
+            control: ControlConfig::default(),
         }
     }
 }

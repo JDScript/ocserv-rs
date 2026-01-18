@@ -50,6 +50,8 @@ impl HttpServer {
             let dtls_sessions = state.dtls_sessions.clone();
             let cert_path = self.config.server.cert_path.clone();
             let key_path = self.config.server.key_path.clone();
+            let dtls_buffer_size = self.config.performance.buffer_size;
+            let dtls_channel_capacity = self.config.performance.channel_capacity;
             info!("Starting DTLS server on UDP port {}", dtls_port);
 
             tokio::spawn(async move {
@@ -58,8 +60,8 @@ impl HttpServer {
                     dtls_sessions,
                     &cert_path,
                     &key_path,
-                    self.config.performance.buffer_size,
-                    self.config.performance.channel_capacity,
+                    dtls_buffer_size,
+                    dtls_channel_capacity,
                 )
                 .await
                 {
@@ -74,6 +76,19 @@ impl HttpServer {
                 }
             });
         }
+
+        // Start Control Server
+        let control_config = self.config.control.clone();
+        let control_state = state.clone();
+        tokio::spawn(async move {
+            info!("Starting Control Server on {}", control_config.socket_path);
+            if let Err(e) = crate::control::ControlServer::new(control_config, control_state)
+                .run()
+                .await
+            {
+                error!("Control Server error: {}", e);
+            }
+        });
 
         loop {
             let (tcp_stream, remote_addr) = listener.accept().await?;
@@ -247,6 +262,43 @@ impl HttpServer {
                                     }));
                                 }
 
+                                // Validate session and get user info
+                                let webvpn_cookie = request
+                                    .headers
+                                    .iter()
+                                    .find(|(k, _)| k.to_lowercase() == "cookie")
+                                    .and_then(|(_, v)| {
+                                        crate::http::handlers::auth::extract_webvpn_token(v)
+                                    });
+
+                                let session_token = if let Some(token) = webvpn_cookie {
+                                    if state.session_manager.get_session_by_token(&token).is_none()
+                                    {
+                                        warn!(
+                                            "Invalid or missing session token in CONNECT request"
+                                        );
+                                        let response = HttpResponse::new(401, "Unauthorized")
+                                            .body_str("Unauthorized");
+                                        if let Err(e) =
+                                            write_response(&mut tls_stream, &response, 0).await
+                                        {
+                                            debug!("Failed to write 401 response: {}", e);
+                                        }
+                                        break;
+                                    }
+                                    token
+                                } else {
+                                    warn!("No session cookie in CONNECT request");
+                                    let response = HttpResponse::new(401, "Unauthorized")
+                                        .body_str("Unauthorized");
+                                    if let Err(e) =
+                                        write_response(&mut tls_stream, &response, 0).await
+                                    {
+                                        debug!("Failed to write 401 response: {}", e);
+                                    }
+                                    break;
+                                };
+
                                 // Allocate IP address for the client
                                 let assigned_ip = match state.ip_pool.allocate() {
                                     Ok(ip) => ip,
@@ -359,10 +411,25 @@ impl HttpServer {
                                     )
                                 };
 
+                                // Register active tunnel
+                                let user_agent = request
+                                    .header("User-Agent")
+                                    .unwrap_or("Unknown")
+                                    .to_string();
+                                state.session_manager.register_tunnel(
+                                    &session_token,
+                                    assigned_ip.to_string(),
+                                    remote_addr,
+                                    user_agent,
+                                );
+
                                 // Run the tunnel
                                 if let Err(e) = tunnel.run().await {
                                     warn!("VPN tunnel ended with error: {}", e);
                                 }
+
+                                // Unregister active tunnel
+                                state.session_manager.unregister_tunnel(&session_token);
 
                                 // Release IP address
                                 state.ip_pool.release(assigned_ip);

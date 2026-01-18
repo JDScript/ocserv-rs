@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 authors = ["jdscript"]
 
+[[bin]]
+name = "occtl"
+path = "src/bin/occtl.rs"
+[[bin]]
+name = "ocserv-rs"
+path = "src/main.rs"
+
 [dependencies]
 # Async runtime (CSTP packets sent over same TLS stream after CONNECT)
 tokio = { version = "1.35", features = ["full"] }
@@ -58,6 +65,8 @@ serde_json = "1.0.149"
 flate2 = "1.1.8"
 chrono = "0.4.43"
 http-body = "1.0.1"
+cli-table = "0.4"
+crossterm = "0.27"
 
 # OAuth2 token exchange HTTP client
 reqwest = { version = "0.11", features = ["rustls-tls", "blocking", "json"], default-features = false }

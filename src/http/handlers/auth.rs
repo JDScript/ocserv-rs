@@ -376,7 +376,7 @@ fn build_sso_form_xml(state: &Arc<ServerState>, sso_url: &str, sso_final_url: &s
 
 // build_auth_form_xml removed as its logic is now inside handle_auth_init via render_template
 
-fn extract_webvpn_token(cookie: &str) -> Option<String> {
+pub fn extract_webvpn_token(cookie: &str) -> Option<String> {
     for pair in cookie.split(';') {
         let pair = pair.trim();
         // Check for standard webvpn cookie or anyconnect SAML cookie

@@ -11,11 +11,16 @@ pub struct VpnSession {
     pub hpke_ctx_id: Option<String>, // ID to lookup HPKE context for encryption
     pub user_info: UserInfo,
     pub created_at: std::time::Instant,
+    // Active tunnel tracking
+    pub vpn_ip: Option<String>,
+    pub remote_ip: Option<std::net::SocketAddr>,
+    pub user_agent: Option<String>,
+    pub connected_at: Option<std::time::Instant>,
 }
 
 /// Session manager for tracking active VPN sessions
 pub struct SessionManager {
-    sessions: Arc<Mutex<HashMap<String, VpnSession>>>,
+    pub sessions: Arc<Mutex<HashMap<String, VpnSession>>>,
 }
 
 impl SessionManager {
@@ -35,7 +40,12 @@ impl SessionManager {
             session_token,
             hpke_ctx_id,
             user_info,
+
             created_at: std::time::Instant::now(),
+            vpn_ip: None,
+            remote_ip: None,
+            user_agent: None,
+            connected_at: None,
         };
 
         self.sessions
@@ -74,6 +84,34 @@ impl SessionManager {
         let mut bytes = [0u8; 32];
         rand::rng().fill_bytes(&mut bytes);
         hex::encode(bytes).to_uppercase()
+    }
+
+    /// Register an active tunnel for a session
+    pub fn register_tunnel(
+        &self,
+        token: &str,
+        vpn_ip: String,
+        remote_ip: std::net::SocketAddr,
+        user_agent: String,
+    ) {
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(session) = sessions.values_mut().find(|s| s.session_token == token) {
+            session.vpn_ip = Some(vpn_ip);
+            session.remote_ip = Some(remote_ip);
+            session.user_agent = Some(user_agent);
+            session.connected_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Unregister an active tunnel
+    pub fn unregister_tunnel(&self, token: &str) {
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(session) = sessions.values_mut().find(|s| s.session_token == token) {
+            session.vpn_ip = None;
+            session.remote_ip = None;
+            session.user_agent = None;
+            session.connected_at = None;
+        }
     }
 }
 
