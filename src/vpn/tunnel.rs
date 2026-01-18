@@ -1,40 +1,34 @@
 use crate::vpn::cstp::{CstpPacket, PacketType, CSTP_HEADER_LEN};
+use crate::vpn::dtls_engine::DtlsEngine;
 use crate::vpn::tun_device::TunDevice;
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 pub struct VpnTunnel<IO> {
     io: IO,
     tun: TunDevice,
-    /// Optional receiver for DTLS packets to write to TUN
+    /// Receiver for Encrypted DTLS packets (from DtlsServer)
     dtls_rx: Option<mpsc::Receiver<Bytes>>,
-    /// Optional receiver for DTLS readiness signal (socket, addr)
-    dtls_signal_rx: Option<mpsc::Receiver<(Arc<tokio::net::UdpSocket>, std::net::SocketAddr)>>,
-    /// Channel to send outgoing packets to DTLS session task
-    dtls_out_tx: Option<mpsc::Sender<Bytes>>,
-    // Configurable performance parameters
-    buffer_size: usize,
-    channel_capacity: usize,
+    /// Receiver for DTLS engine and socket (Signal)
+    dtls_signal_rx:
+        Option<mpsc::Receiver<(DtlsEngine, Arc<tokio::net::UdpSocket>, std::net::SocketAddr)>>,
 }
 
 impl<IO> VpnTunnel<IO>
 where
     IO: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
-    pub fn new(io: IO, tun: TunDevice, buffer_size: usize, channel_capacity: usize) -> Self {
+    pub fn new(io: IO, tun: TunDevice) -> Self {
         Self {
             io,
             tun,
             dtls_rx: None,
             dtls_signal_rx: None,
-            dtls_out_tx: None,
-            buffer_size,
-            channel_capacity,
         }
     }
 
@@ -43,19 +37,17 @@ where
         io: IO,
         tun: TunDevice,
         dtls_rx: mpsc::Receiver<Bytes>,
-        dtls_signal_rx: mpsc::Receiver<(Arc<tokio::net::UdpSocket>, std::net::SocketAddr)>,
-        dtls_out_tx: mpsc::Sender<Bytes>,
-        buffer_size: usize,
-        channel_capacity: usize,
+        dtls_signal_rx: mpsc::Receiver<(
+            DtlsEngine,
+            Arc<tokio::net::UdpSocket>,
+            std::net::SocketAddr,
+        )>,
     ) -> Self {
         Self {
             io,
             tun,
             dtls_rx: Some(dtls_rx),
             dtls_signal_rx: Some(dtls_signal_rx),
-            dtls_out_tx: Some(dtls_out_tx),
-            buffer_size,
-            channel_capacity,
         }
     }
 
@@ -65,153 +57,145 @@ where
         let (mut tls_r, mut tls_w) = tokio::io::split(self.io);
         let (mut tun_r, mut tun_w) = self.tun.split();
 
-        // Shared state for DTLS availability
+        // Shared state for DTLS
+        // We use a regular std::sync::Mutex because DtlsEngine operations are non-blocking (memory only).
+        // This avoids async Mutex overhead in the hot path.
+        struct DtlsState {
+            engine: DtlsEngine,
+            socket: Arc<tokio::net::UdpSocket>,
+            addr: std::net::SocketAddr,
+        }
+        let dtls_state: Arc<Mutex<Option<DtlsState>>> = Arc::new(Mutex::new(None));
         let use_dtls = Arc::new(AtomicBool::new(false));
 
         // INTERNAL CHANNELS:
-        // 1. Control Packets: Task 2 (TLS Read) -> Task 1 (TLS Write)
-        // Used for DPD Responses, KeepAlives, etc. Small capacity is sufficient.
+        // Control Packets: Task 2 (TLS Read) -> Task 1 (TLS Write)
         let (control_tx, mut control_rx) = mpsc::channel::<Bytes>(64);
 
-        // 2. TUN Writes: DTLS Reader -> Task 2 (TUN Writer)
-        // Since we have multiple sources for TUN (TLS & DTLS), and we own the Writer in Task 2.
-        let (tun_write_tx, mut tun_write_rx) = mpsc::channel::<Bytes>(self.channel_capacity);
-
-        // OPTIMIZATION: Signal Monitor Task (Low Overhead)
-        // Updates AtomicBool so the hot path doesn't need to select! on the signal channel.
+        // SIGNAL MONITOR TASK
         if let Some(mut signal_rx) = self.dtls_signal_rx {
             let use_dtls_signal = use_dtls.clone();
+            let dtls_state_signal = dtls_state.clone();
+
             tokio::spawn(async move {
-                while let Some((_socket, _addr)) = signal_rx.recv().await {
-                    info!("VPN Tunnel: DTLS enabled via signal");
+                while let Some((engine, socket, addr)) = signal_rx.recv().await {
+                    info!("VPN Tunnel: DTLS enabled via signal for {}", addr);
+                    {
+                        let mut state = dtls_state_signal.lock().unwrap();
+                        *state = Some(DtlsState {
+                            engine,
+                            socket,
+                            addr,
+                        });
+                    }
                     use_dtls_signal.store(true, Ordering::Relaxed);
                 }
-                // If channel closes, we assume DTLS is disabled? Or just stop updating?
-                // Usually indicates shutdown, but let's be safe.
                 use_dtls_signal.store(false, Ordering::Relaxed);
             });
         }
 
-        // TASK 1: TUN Reader & TLS Writer (+ Incoming Control Packets)
-        // - Reads IP packets from TUN
-        // - Encodes them (CSTP)
-        // - Batches them logic (Latency-aware: Flush on full or timeout)
-        // - Writes to TLS
-        // - Also handles high-priority Control packets from Task 2
-        let dtls_out_tx = self.dtls_out_tx.clone();
+        // TASK 1: TUN Reader & TLS Writer (+ Incoming Control Packets + DTLS Egress)
         let use_dtls_t1 = use_dtls.clone();
-        let buffer_size = self.buffer_size;
+        let dtls_state_t1 = dtls_state.clone();
 
         let task1 = tokio::spawn(async move {
-            info!("TUN Reader / TLS Writer task started");
-            let mut tun_buf = vec![0u8; buffer_size];
-            let mut tls_batch = BytesMut::with_capacity(64 * 1024);
-            let mut batch_deadline: Option<tokio::time::Instant> = None;
+            let mut tun_buf = vec![0u8; 65535]; // Max IP packet
+            let mut tls_batch = BytesMut::with_capacity(65535);
 
             loop {
-                // Prepare timeout future for batch flushing
-                let timeout_fut = async {
-                    if let Some(deadline) = batch_deadline {
-                        tokio::time::sleep_until(deadline).await;
-                        true
-                    } else {
-                        std::future::pending::<bool>().await;
-                        false
-                    }
-                };
-
                 tokio::select! {
-                     // Priority 1: Batch Flush Timeout
-                     _ = timeout_fut, if batch_deadline.is_some() => {
-                         if !tls_batch.is_empty() {
-                             if let Err(e) = tls_w.write_all(&tls_batch).await {
-                                 error!("TLS write error (flush): {}", e);
-                                 break;
-                             }
-                             if let Err(e) = tls_w.flush().await {
-                                 error!("TLS flush error: {}", e);
-                                 break;
-                             }
-                             tls_batch.clear();
-                             batch_deadline = None;
-                         }
-                     }
-
-                     // Priority 2: Control Packets (from Other Task)
-                     // Must be flushed immediately (low latency)
+                     // Priority 1: Control Packets (from Other Task)
                      res = control_rx.recv() => {
                          match res {
                              Some(msg) => {
-                                 // Flush existing batch first to maintain order (and clear buffer)
+                                 // Flush existing batch first (if any - though we disabled batching)
                                  if !tls_batch.is_empty() {
                                      if let Err(e) = tls_w.write_all(&tls_batch).await {
                                          error!("TLS write error (pre-control): {}", e);
                                          break;
                                      }
-                                     if let Err(e) = tls_w.flush().await {
+                                      if let Err(e) = tls_w.flush().await {
                                          error!("TLS flush error (pre-control): {}", e);
                                          break;
                                      }
                                      tls_batch.clear();
-                                     batch_deadline = None;
                                  }
 
                                  if let Err(e) = tls_w.write_all(&msg).await {
                                      error!("TLS write error (control): {}", e);
                                      break;
                                  }
-                                 if let Err(e) = tls_w.flush().await {
+                                  if let Err(e) = tls_w.flush().await {
                                      error!("TLS flush error (control): {}", e);
                                      break;
                                  }
                              }
-                             None => break, // Control channel closed
+                             None => break,
                          }
                      }
 
-                     // Priority 3: TUN Read
-                     res = tun_r.read(&mut tun_buf) => {
+                     // Priority 2: TUN Read
+                     // Optimization: Read into offset 1 to allow prepending 0x00 (DATA) header without allocation
+                     res = tun_r.read(&mut tun_buf[1..]) => {
                          match res {
                              Ok(0) => break, // EOF
                              Ok(n) => {
-                                 let payload = &tun_buf[..n];
+                                 // Add 1-byte header 0x00 (DATA)
+                                 tun_buf[0] = 0x00;
+                                 let packet_with_header = &tun_buf[0..n+1];
+                                 let payload_only = &tun_buf[1..n+1]; // For TLS fallback
 
                                  // OPTIMIZATION: DTLS Fast Path
-                                 // If enabled, try to send via DTLS first.
                                  let mut sent_via_dtls = false;
                                  if use_dtls_t1.load(Ordering::Relaxed) {
-                                     if let Some(tx) = &dtls_out_tx {
-                                         // We must copy here because we are sending to another task/socket
-                                         let bytes = Bytes::copy_from_slice(payload);
-                                         // Use try_send to avoid blocking TUN reader
-                                         match tx.try_send(bytes) {
-                                             Ok(_) => {
-                                                 sent_via_dtls = true;
+                                     // Scope the lock to extract data synchronously
+                                     let dtls_send_info = {
+                                         if let Ok(mut guard) = dtls_state_t1.lock() {
+                                             if let Some(state) = guard.as_mut() {
+                                                 // Feed packet WITH HEADER
+                                                 if state.engine.feed_decrypted(packet_with_header).is_ok() {
+                                                     if let Ok(Some(encrypted)) = state.engine.extract_outgoing() {
+                                                         Some((encrypted, state.socket.clone(), state.addr))
+                                                     } else {
+                                                         None
+                                                     }
+                                                 } else {
+                                                     None
+                                                 }
+                                             } else {
+                                                 None
                                              }
-                                             Err(_) => {
-                                                 // Drop or Fallback?
-                                                 // Common strategy: Fallback to TLS if DTLS is full/congested
-                                                 // warn!("DTLS channel full, falling back to TLS");
-                                             }
+                                         } else {
+                                             None
+                                         }
+                                     };
+
+                                     if let Some((encrypted, sock, target)) = dtls_send_info {
+                                         // Send async OUTSIDE the lock
+                                         if let Err(_e) = sock.send_to(&encrypted, target).await {
+                                             // warn!("DTLS send error: {}", _e);
+                                         } else {
+                                             sent_via_dtls = true;
                                          }
                                      }
                                  }
 
                                  if !sent_via_dtls {
-                                     // TLS Path: Zero-Copy Encode info Batch (serving as temp buffer)
-                                     CstpPacket::write_packet(PacketType::Data, payload, &mut tls_batch);
+                                     // TLS Path: Zero-Copy Encode into Buffer
+                                     // reusing tls_batch as temp buffer (disabled batching)
+                                     // Note: TLS framing expects just the IP payload, acts as transport.
+                                     // CstpPacket::write_packet wraps it.
+                                     CstpPacket::write_packet(PacketType::Data, payload_only, &mut tls_batch);
 
-                                     // Disable Batching for stability: Flush immediately
                                      if let Err(e) = tls_w.write_all(&tls_batch).await {
                                          error!("TLS write error: {}", e);
                                          break;
                                      }
-                                     if let Err(e) = tls_w.flush().await {
+                                     if let Err(e) = tls_w.flush().await { // Explict flush
                                          error!("TLS flush error: {}", e);
                                          break;
                                      }
                                      tls_batch.clear();
-                                     batch_deadline = None;
                                  }
                              }
                              Err(e) => {
@@ -222,104 +206,154 @@ where
                      }
                 }
             }
-            debug!("TUN Reader / TLS Writer task finished");
         });
 
-        // TASK 2: TLS Reader & TUN Writer (+ DTLS Incoming)
-        // - Reads CSTP packets from TLS
-        // - Writes DATA payload to TUN
-        // - Sends CONTROL payload to Task 1
-        // - Also accepts Decrypted DTLS packets and writes to TUN
-        let tun_write_tx_dtls = tun_write_tx.clone();
+        // TASK 2: TLS Reader & DTLS Ingress -> TUN Writer
+        let mut dtls_rx = self.dtls_rx; // Option<Receiver>
+        let dtls_state_t2 = dtls_state.clone();
 
         let task2 = tokio::spawn(async move {
-            info!("TLS Reader / TUN Writer task started");
-            let mut tls_in_buf = BytesMut::with_capacity(8192);
+            let mut tls_in_buf = BytesMut::with_capacity(65535);
 
             loop {
                 tokio::select! {
-                    // 1. Incoming DTLS Packets (Decrypted) -> Write to TUN
-                    res = tun_write_rx.recv() => {
+                    // 1. Encrypted DTLS Packet (Ingress)
+                    // Only poll if we have a receiver
+                    res = async {
+                        match &mut dtls_rx {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    }, if dtls_rx.is_some() => {
                         match res {
-                            Some(packet) => {
-                                if let Err(e) = tun_w.write_all(&packet).await {
-                                    error!("TUN write error (DTLS): {}", e);
-                                    break;
+                            Some(encrypted) => {
+                                // Decrypt using DtlsEngine
+                                let mut to_write_tun = Vec::new();
+                                let mut to_send_socket = Vec::new(); // Handshake replies
+                                let mut sock_info: Option<(Arc<tokio::net::UdpSocket>, std::net::SocketAddr)> = None;
+
+                                {
+                                    if let Ok(mut guard) = dtls_state_t2.lock() {
+                                        if let Some(state) = guard.as_mut() {
+                                            match state.engine.feed_encrypted(&encrypted) {
+                                                Ok(decrypted_list) => {
+                                                    for packet in decrypted_list {
+                                                        // Handle 1-byte Header
+                                                        if packet.is_empty() { continue; }
+                                                        let pkt_type = packet[0];
+
+                                                        match pkt_type {
+                                                            0x00 => { // DATA
+                                                                // packet[0] is header, [1..] is payload
+                                                                if packet.len() > 1 {
+                                                                    to_write_tun.push(packet[1..].to_vec());
+                                                                }
+                                                            },
+                                                            0x03 => { // DPD_REQ -> Send DPD_RESP (0x04)
+                                                                // We can write directly to engine here (it handles encryption)
+                                                                let _ = state.engine.feed_decrypted(&[0x04]);
+                                                            },
+                                                            0x07 => { // KEEPALIVE -> Respond with KEEPALIVE (0x07) or ignore
+                                                                // ocserv usually echoes keepalives or sends dummy
+                                                                let _ = state.engine.feed_decrypted(&[0x07]);
+                                                            },
+                                                            0x05 => { // DISCONNECT
+                                                                info!("Received DTLS DISCONNECT");
+                                                            },
+                                                            _ => {
+                                                                debug!("RX DTLS Unknown Type: 0x{:02x}", pkt_type);
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                                Err(e) => {
+                                                     error!("DTLS feed_encrypted failed: {}", e);
+                                                }
+                                            }
+                                            // Check for outgoing (Handshake replies/Control/DPD RESP)
+                                            if let Ok(Some(outgoing)) = state.engine.extract_outgoing() {
+                                                to_send_socket = outgoing;
+                                                sock_info = Some((state.socket.clone(), state.addr));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Write decrypted to TUN
+                                for packet in to_write_tun {
+                                    if let Err(e) = tun_w.write_all(&packet).await {
+                                        error!("TUN write error (DTLS): {}", e);
+                                        return; // Fatal
+                                    }
+                                }
+
+                                // Send handshake replies if any
+                                if !to_send_socket.is_empty() {
+                                    if let Some((sock, target)) = sock_info {
+                                        let _ = sock.send_to(&to_send_socket, target).await;
+                                    }
                                 }
                             }
                             None => {
-                                // Channel should stay open unless DTLS task dies?
-                                // We keep running for TLS.
+                                dtls_rx = None; // Channel closed
                             }
                         }
                     }
 
-                    // 2. Incoming TLS Data -> Parse -> Write to TUN / Send Control to Task 1
+                    // 2. TLS Read
                     res = tls_r.read_buf(&mut tls_in_buf) => {
                         match res {
                             Ok(0) => {
-                                info!("TLS Connection Closed (EOF)");
+                                info!("TLS connection closed (EOF)");
                                 break;
                             }
-                            Ok(_) => {
-                                // Parse Loop (process all complete packets in buffer)
+                            Ok(_n) => {
+                                // Process multiple packets in buffer
                                 loop {
-                                    // 1. Check Header
                                     if tls_in_buf.len() < CSTP_HEADER_LEN {
                                         break; // Need more data
                                     }
 
-                                    let len_result = {
-                                        let h = &tls_in_buf[..CSTP_HEADER_LEN];
-                                        CstpPacket::parse_header(h)
-                                    };
+                                    // Parse Header (Zero Copy check)
+                                    // CSTP Header: Magic(3) + Type(1) + Len(2).. actually depends on version but standard is:
+                                    // MAGIC: "STF\x01" (4 bytes)
+                                    // Len: u16 (2 bytes)
+                                    // Type: u16/u8? CstpPacket code says: Header is 8 bytes.
+                                    // MAGIC(4) + Len(2) + Type(1) + Pad(1)
 
-                                    match len_result {
-                                        Ok((packet_type, payload_len)) => {
-                                            let total_len = CSTP_HEADER_LEN + payload_len;
-                                            if tls_in_buf.len() < total_len {
-                                                // Ensure capacity for the full packet relative to current buffer content
-                                                if tls_in_buf.capacity() < total_len {
-                                                    tls_in_buf.reserve(total_len - tls_in_buf.len());
-                                                }
-                                                break; // Wait for body
-                                            }
+                                    let body_len = u16::from_be_bytes([tls_in_buf[4], tls_in_buf[5]]) as usize;
+                                    let total_len = CSTP_HEADER_LEN + body_len;
 
-                                            // Extract Packet
-                                            let packet_data = tls_in_buf.split_to(total_len);
-                                            let payload = &packet_data[CSTP_HEADER_LEN..];
+                                    if tls_in_buf.len() < total_len {
+                                        tls_in_buf.reserve(total_len - tls_in_buf.len());
+                                        break;
+                                    }
 
-                                            // Handle Packet
-                                            match packet_type {
-                                                PacketType::Data => {
-                                                    if let Err(e) = tun_w.write_all(&payload).await {
-                                                        error!("TUN write error (TLS): {}", e);
-                                                        return;
-                                                    }
-                                                }
-                                                PacketType::DpdReq => {
-                                                    debug!("Received DPD-REQ");
-                                                    let resp = CstpPacket::new(PacketType::DpdResp, Bytes::copy_from_slice(payload));
-                                                    let _ = control_tx.send(resp.encode()).await;
-                                                }
-                                                PacketType::KeepAlive => {
-                                                    let resp = CstpPacket::new(PacketType::KeepAlive, Bytes::new());
-                                                    let _ = control_tx.send(resp.encode()).await;
-                                                }
-                                                PacketType::Disconnect => {
-                                                    let reason = String::from_utf8_lossy(&payload);
-                                                    info!("Received DISCONNECT: {}", reason);
-                                                    return;
-                                                }
-                                                _ => {
-                                                    warn!("Unhandled packet type: {:?}", packet_type);
-                                                }
+                                    let packet_data = tls_in_buf.split_to(total_len);
+                                    let packet_type = PacketType::from(packet_data[6]);
+                                    let payload = &packet_data[CSTP_HEADER_LEN..];
+
+                                    match packet_type {
+                                        PacketType::Data => {
+                                            if let Err(e) = tun_w.write_all(payload).await {
+                                                 error!("TUN write error (TLS): {}", e);
+                                                 return;
                                             }
                                         }
-                                        Err(e) => {
-                                            error!("CSTP Header Parse Error: {}", e);
-                                            return; // Fatal protocol error
+                                        PacketType::DpdReq => {
+                                            // Send DpdResp to Task 1
+                                            let resp = CstpPacket::new(PacketType::DpdResp, Bytes::copy_from_slice(payload));
+                                            let _ = control_tx.send(resp.encode()).await;
                                         }
+                                        PacketType::KeepAlive => {
+                                            let resp = CstpPacket::new(PacketType::KeepAlive, Bytes::copy_from_slice(payload));
+                                            let _ = control_tx.send(resp.encode()).await;
+                                        }
+                                        PacketType::Disconnect => {
+                                            info!("Received DISCONNECT");
+                                            return;
+                                        }
+                                        _ => debug!("Ignored control packet: {:?}", packet_type),
                                     }
                                 }
                             }
@@ -331,28 +365,12 @@ where
                     }
                 }
             }
-            debug!("TLS Reader / TUN Writer task finished");
         });
 
-        // TASK 3: DTLS Reader (Legacy Adapter)
-        // If DTLS is configured, we spawn a reader that simply forwards to Task 2
-        if let Some(mut dtls_rx) = self.dtls_rx {
-            tokio::spawn(async move {
-                info!("DTLS Receiver task started");
-                while let Some(packet) = dtls_rx.recv().await {
-                    if let Err(_) = tun_write_tx_dtls.send(packet).await {
-                        break;
-                    }
-                }
-                debug!("DTLS Receiver task finished");
-            });
-        }
-
-        // Wait for main tasks
-        // If either Task 1 or Task 2 fails/finishes, we should probably stop the whole tunnel.
+        // Use select! to wait for either task to finish/error
         tokio::select! {
-            _ = task1 => {},
-            _ = task2 => {},
+            _ = task1 => { info!("Tunnel Task 1 finished"); },
+            _ = task2 => { info!("Tunnel Task 2 finished"); },
         }
 
         Ok(())

@@ -130,16 +130,12 @@ pub struct PerformanceConfig {
     /// Buffer size for TUN/DTLS reads (default: 65535)
     #[serde(default = "default_buffer_size")]
     pub buffer_size: usize,
-    /// Channel capacity for packet queues (default: 256)
-    #[serde(default = "default_channel_capacity")]
-    pub channel_capacity: usize,
 }
 
 impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
             buffer_size: default_buffer_size(),
-            channel_capacity: default_channel_capacity(),
         }
     }
 }
@@ -169,10 +165,6 @@ fn default_socket_path() -> String {
 
 fn default_buffer_size() -> usize {
     65535
-}
-
-fn default_channel_capacity() -> usize {
-    256
 }
 
 fn default_ipv4_pool() -> String {

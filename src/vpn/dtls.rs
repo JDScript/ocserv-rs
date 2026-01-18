@@ -4,9 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -14,15 +12,13 @@ use foreign_types::ForeignTypeRef;
 use openssl::pkey::Id;
 use openssl::ssl::{SslAcceptor, SslContext, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::vpn::dtls_engine::{DtlsEngine, DtlsMode};
+
 /// Detect certificate type and return appropriate DTLS cipher suite.
-///
-/// EC (ECDSA) certificates require ECDHE-ECDSA ciphers.
-/// RSA certificates require ECDHE-RSA or DHE-RSA ciphers.
 fn detect_cipher_suite_for_cert(cert_path: &str) -> Result<&'static str> {
     let cert_pem = std::fs::read(cert_path)
         .context(format!("Failed to read certificate file: {}", cert_path))?;
@@ -63,21 +59,20 @@ fn detect_cipher_suite_for_cert(cert_path: &str) -> Result<&'static str> {
 }
 
 /// DTLS session information stored after CONNECT handshake
+/// Updated to support DtlsEngine architecture
 pub struct DtlsSessionInfo {
     /// Pre-shared key (32 bytes, derived via RFC 5705)
     pub psk: Vec<u8>,
-    /// Channel to send packets to the TUN device
+    /// Channel to send Encrpyted packets to VpnTunnel (dtls_rx)
     pub tun_tx: Option<mpsc::Sender<Bytes>>,
-    /// Channel to signal VpnTunnel that DTLS is ready (socket, addr)
-    pub dtls_signal_tx: Option<mpsc::Sender<(Arc<UdpSocket>, SocketAddr)>>,
-    /// Channel to receive packets intended for the client (outgoing)
-    pub dtls_out_rx: Option<mpsc::Receiver<Bytes>>,
+    /// Channel to signal VpnTunnel that DTLS is initialized (Engine, Socket, Addr)
+    pub dtls_signal_tx: Option<mpsc::Sender<(DtlsEngine, Arc<UdpSocket>, SocketAddr)>>,
 }
 
 /// Thread-safe store mapping session_id (hex) -> session info
 pub type DtlsSessionStore = Arc<RwLock<HashMap<String, DtlsSessionInfo>>>;
 
-/// DTLS packet types (1-byte header inside DTLS record)
+/// DTLS packet types (1-byte header inside DTLS record - handled by DtlsEngine/VpnTunnel now)
 pub mod packet_type {
     pub const DATA: u8 = 0x00;
     pub const DPD_REQ: u8 = 0x03;
@@ -92,13 +87,12 @@ pub struct DtlsServer {
     socket: Arc<UdpSocket>,
     ssl_context: SslContext,
     sessions: DtlsSessionStore,
-    /// Map of address -> channel for routing incoming packets
+    /// Map of Address -> Channel to VpnTunnel (for forwarding ENCRYPTED packets)
     active_sessions: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>,
     /// Map of ssl_ptr -> session_id (populated before handshake)
     pending_session_ids: Arc<RwLock<HashMap<usize, String>>>,
     // Configurable performance parameters
     buffer_size: usize,
-    channel_capacity: usize,
 }
 
 impl DtlsServer {
@@ -109,7 +103,6 @@ impl DtlsServer {
         cert_path: &str,
         key_path: &str,
         buffer_size: usize,
-        channel_capacity: usize,
     ) -> Result<Self> {
         let bind_addr = format!("0.0.0.0:{}", port);
         let socket = UdpSocket::bind(&bind_addr)
@@ -147,7 +140,6 @@ impl DtlsServer {
         builder.set_psk_server_callback(move |ssl, _identity, psk_buf| {
             let ssl_ptr = ssl.as_ptr() as usize;
 
-            // Get the session_id that was stored before handshake started
             let session_id = {
                 let map = pending_ids_clone.read().unwrap();
                 map.get(&ssl_ptr).cloned()
@@ -158,6 +150,7 @@ impl DtlsServer {
                 if let Some(info) = store.get(&sid) {
                     let key = &info.psk;
                     if key.len() <= psk_buf.len() {
+                        // copy_from_slice is nightly on slice? No, standard.
                         psk_buf[..key.len()].copy_from_slice(key);
                         info!("PSK callback: found key for session {}", sid);
                         return Ok(key.len());
@@ -186,7 +179,6 @@ impl DtlsServer {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             pending_session_ids: pending_ids,
             buffer_size,
-            channel_capacity,
         })
     }
 
@@ -194,28 +186,27 @@ impl DtlsServer {
     pub async fn run(self) -> Result<()> {
         // Use configurable buffer size
         let mut buf = vec![0u8; self.buffer_size];
+        let socket = self.socket.clone();
 
         loop {
             // Receive UDP packet
-            let (n, addr) = self.socket.recv_from(&mut buf).await?;
+            let (n, addr) = socket.recv_from(&mut buf).await?;
             let packet = Bytes::copy_from_slice(&buf[..n]);
 
             // Check if we have an active session for this address
-            let has_session = {
+            let tx = {
                 let sessions = self.active_sessions.read().unwrap();
-                sessions.contains_key(&addr)
+                sessions.get(&addr).cloned()
             };
 
-            if has_session {
-                // Forward to existing session (non-blocking)
-                let tx = {
-                    let sessions = self.active_sessions.read().unwrap();
-                    sessions.get(&addr).cloned()
-                };
-                if let Some(tx) = tx {
-                    // Use try_send to avoid blocking - drop packet if channel full
-                    if tx.try_send(packet).is_err() {
-                        debug!("DTLS session queue full, dropping packet");
+            if let Some(tx) = tx {
+                // Forward (Encrypted) to VpnTunnel
+                if tx.try_send(packet).is_err() {
+                    debug!("DTLS session queue full (or closed), dropping packet");
+                    // If closed, maybe remove from active_sessions?
+                    if tx.is_closed() {
+                        warn!("Channel closed for {}, removing session", addr);
+                        self.active_sessions.write().unwrap().remove(&addr);
                     }
                 }
             } else {
@@ -225,51 +216,79 @@ impl DtlsServer {
                 if let Some(sid) = session_id {
                     info!("New DTLS session from {} with session_id {}", addr, sid);
 
-                    // Verify we have a PSK for this session
-                    let has_psk = {
+                    // Lookup Session
+                    let (tun_tx, dtls_signal_tx) = {
                         let store = self.sessions.read().unwrap();
-                        store.contains_key(&sid)
+                        if let Some(info) = store.get(&sid) {
+                            (info.tun_tx.clone(), info.dtls_signal_tx.clone())
+                        } else {
+                            (None, None)
+                        }
                     };
 
-                    if has_psk {
-                        // Create channel for this session with configurable capacity
-                        let (tx, rx) = mpsc::channel::<Bytes>(self.channel_capacity);
+                    if let (Some(tun_tx), Some(signal_tx)) = (tun_tx, dtls_signal_tx) {
+                        // Create DtlsEngine
+                        match DtlsEngine::new(&self.ssl_context, DtlsMode::Server) {
+                            Ok(mut engine) => {
+                                // Register SSL pointer for PSK callback
+                                let ptr = engine.ssl_ptr();
+                                {
+                                    let mut ids = self.pending_session_ids.write().unwrap();
+                                    ids.insert(ptr, sid.clone());
+                                }
 
-                        // Store in active sessions
-                        {
-                            let mut sessions = self.active_sessions.write().unwrap();
-                            sessions.insert(addr, tx.clone());
-                        }
+                                // Attach Cleanup Guard
+                                struct SessionGuard {
+                                    ptr: usize,
+                                    // We use Weak or Arc? Arc is fine as DtlsServer holds Arc.
+                                    // But pending_session_ids is valid as long as DtlsServer is valid.
+                                    // If DtlsServer drops, map drops. Guard dropping might try to access map?
+                                    // Yes, guard should hold Arc.
+                                    pending_ids: Arc<RwLock<HashMap<usize, String>>>,
+                                }
 
-                        // Send the initial packet
-                        let _ = tx.send(packet).await;
+                                impl Drop for SessionGuard {
+                                    fn drop(&mut self) {
+                                        if let Ok(mut map) = self.pending_ids.write() {
+                                            map.remove(&self.ptr);
+                                            // debug!("Cleaned up pending session_id for ptr {}", self.ptr);
+                                        }
+                                    }
+                                }
 
-                        // Spawn session handler
-                        let socket = self.socket.clone();
-                        let ctx = self.ssl_context.clone();
-                        let sessions_store = self.sessions.clone();
-                        let active_sessions = self.active_sessions.clone();
-                        let pending_ids = self.pending_session_ids.clone();
-                        let sid_clone = sid.clone();
+                                let guard = SessionGuard {
+                                    ptr,
+                                    pending_ids: self.pending_session_ids.clone(),
+                                };
+                                engine.set_user_data(Box::new(guard));
 
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_dtls_session(
-                                socket,
-                                addr,
-                                rx,
-                                ctx,
-                                sessions_store,
-                                active_sessions,
-                                pending_ids,
-                                sid_clone,
-                            )
-                            .await
-                            {
-                                warn!("DTLS session {} error: {}", addr, e);
+                                // Add to active sessions
+                                {
+                                    let mut sessions = self.active_sessions.write().unwrap();
+                                    sessions.insert(addr, tun_tx.clone());
+                                }
+
+                                // Send Engine to VpnTunnel
+                                if signal_tx
+                                    .send((engine, socket.clone(), addr))
+                                    .await
+                                    .is_err()
+                                {
+                                    warn!("Failed to signal VpnTunnel for DTLS session {}", sid);
+                                    self.active_sessions.write().unwrap().remove(&addr);
+                                } else {
+                                    // Forward the ClientHello packet for processing
+                                    if tun_tx.send(packet).await.is_err() {
+                                        warn!("VpnTunnel channel closed immediately after signal");
+                                    }
+                                }
                             }
-                        });
+                            Err(e) => {
+                                error!("Failed to create DtlsEngine: {}", e);
+                            }
+                        }
                     } else {
-                        warn!("No PSK found for session_id {}, rejecting", sid);
+                        warn!("Session {} found but missing channels", sid);
                     }
                 } else {
                     debug!("Could not extract session_id from packet, ignoring");
@@ -279,24 +298,8 @@ impl DtlsServer {
     }
 
     /// Extract session_id from DTLS ClientHello
-    ///
-    /// DTLS 1.2 ClientHello structure:
-    /// [0]: Content Type (0x16 = Handshake)
-    /// [1-2]: Version
-    /// [3-4]: Epoch
-    /// [5-10]: Sequence Number (6 bytes)
-    /// [11-12]: Length
-    /// [13]: Handshake Type (0x01 = ClientHello)
-    /// [14-16]: Length (24-bit)
-    /// [17-18]: Message Seq
-    /// [19-21]: Fragment Offset (24-bit)
-    /// [22-24]: Fragment Length (24-bit)
-    /// [25-26]: Client Version
-    /// [27-58]: Random (32 bytes)
-    /// [59]: Session ID Length
-    /// [60..]: Session ID bytes
     fn extract_session_id_from_client_hello(&self, packet: &[u8]) -> Option<String> {
-        // Minimum size check
+        // Minimum size check (header + random...)
         if packet.len() < 60 {
             return None;
         }
@@ -307,18 +310,34 @@ impl DtlsServer {
         }
 
         // Check handshake type (0x01 = ClientHello)
+        // Record Header (13 bytes) + Handshake Header (4 bytes)
+        // packet[13] is Handshake Type
         if packet.len() > 13 && packet[13] != 0x01 {
             return None;
         }
 
         // Get session ID length at offset 59
+        // 13 (Rec) + 4 (Hs) + 2 (Ver) + 32 (Rand) = 51?
+        // Let's trace carefully:
+        // Rec: 0..13
+        // Hs: 13..?
+        //   Type: 13 (1 byte)
+        //   Len: 14..17 (3 bytes)
+        //   MsgSeq: 17..19 (2 bytes)
+        //   FragOff: 19..22 (3 bytes)
+        //   FragLen: 22..25 (3 bytes)
+        // ClientVer: 25..27 (2 bytes)
+        // Random: 27..59 (32 bytes)
+        // SessionID Len: 59 (1 byte)
+        // CORRECT.
+
         if packet.len() <= 59 {
             return None;
         }
         let session_id_len = packet[59] as usize;
 
         if session_id_len == 0 {
-            debug!("ClientHello has empty session_id");
+            // debug!("ClientHello has empty session_id");
             return None;
         }
 
@@ -337,249 +356,4 @@ impl DtlsServer {
         );
         Some(session_id_hex)
     }
-}
-
-/// Virtual socket that adapts mpsc channel to AsyncRead/AsyncWrite for tokio-openssl
-struct VirtualSocket {
-    rx: mpsc::Receiver<Bytes>,
-    socket: Arc<UdpSocket>,
-    addr: SocketAddr,
-    read_buf: Bytes,
-}
-
-impl AsyncRead for VirtualSocket {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        // If we have leftover data, use it first
-        if !self.read_buf.is_empty() {
-            let to_copy = std::cmp::min(buf.remaining(), self.read_buf.len());
-            buf.put_slice(&self.read_buf[..to_copy]);
-            self.read_buf = self.read_buf.slice(to_copy..);
-            return Poll::Ready(Ok(()));
-        }
-
-        // Try to receive from channel
-        match Pin::new(&mut self.rx).poll_recv(cx) {
-            Poll::Ready(Some(data)) => {
-                let to_copy = std::cmp::min(buf.remaining(), data.len());
-                buf.put_slice(&data[..to_copy]);
-                if to_copy < data.len() {
-                    self.read_buf = data.slice(to_copy..);
-                }
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(None) => Poll::Ready(Ok(())), // Channel closed
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncWrite for VirtualSocket {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match self.socket.poll_send_to(cx, buf, self.addr) {
-            Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-/// Handle a single DTLS session
-async fn handle_dtls_session(
-    socket: Arc<UdpSocket>,
-    addr: SocketAddr,
-    rx: mpsc::Receiver<Bytes>,
-    ctx: SslContext,
-    store: DtlsSessionStore,
-    active_sessions: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>,
-    pending_ids: Arc<RwLock<HashMap<usize, String>>>,
-    session_id: String,
-) -> Result<()> {
-    use openssl::ssl::Ssl;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // Cleanup on exit
-    struct SessionGuard {
-        addr: SocketAddr,
-        active_sessions: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>,
-        pending_ids: Arc<RwLock<HashMap<usize, String>>>,
-        ssl_ptr: usize,
-    }
-    impl Drop for SessionGuard {
-        fn drop(&mut self) {
-            self.active_sessions.write().unwrap().remove(&self.addr);
-            self.pending_ids.write().unwrap().remove(&self.ssl_ptr);
-            info!("DTLS session {} cleaned up", self.addr);
-        }
-    }
-
-    // Create virtual socket
-    let io = VirtualSocket {
-        rx,
-        socket: socket.clone(),
-        addr,
-        read_buf: Bytes::new(),
-    };
-
-    // Create SSL object
-    let ssl = Ssl::new(&ctx)?;
-    let ssl_ptr = ssl.as_ptr() as usize;
-
-    // Store session_id for PSK callback BEFORE handshake
-    {
-        let mut ids = pending_ids.write().unwrap();
-        ids.insert(ssl_ptr, session_id.clone());
-    }
-
-    let _guard = SessionGuard {
-        addr,
-        active_sessions: active_sessions.clone(),
-        pending_ids: pending_ids.clone(),
-        ssl_ptr,
-    };
-
-    // Create SSL stream and perform handshake
-    let mut stream = tokio_openssl::SslStream::new(ssl, io)?;
-
-    info!("Starting DTLS handshake with {}", addr);
-    Pin::new(&mut stream).accept().await?;
-    info!("DTLS handshake completed with {}", addr);
-
-    // Get TUN sender, DTLS signal channel, and DTLS outgoing receiver
-    let (tun_tx, dtls_signal_tx, mut dtls_out_rx) = {
-        let mut sessions = store.write().unwrap();
-        if let Some(info) = sessions.get_mut(&session_id) {
-            (
-                info.tun_tx.clone(),
-                info.dtls_signal_tx.clone(),
-                info.dtls_out_rx.take(),
-            )
-        } else {
-            (None, None, None)
-        }
-    };
-
-    // Notify VpnTunnel that DTLS is ready for outgoing packets
-    if let Some(signal_tx) = dtls_signal_tx {
-        if signal_tx.send((socket.clone(), addr)).await.is_err() {
-            warn!("Failed to signal VpnTunnel for DTLS session {}", session_id);
-        } else {
-            info!(
-                "Signaled VpnTunnel: DTLS ready for outgoing traffic to {}",
-                addr
-            );
-        }
-    }
-
-    let tun_tx = match tun_tx {
-        Some(tx) => tx,
-        None => {
-            warn!("No TUN sender for session {}", session_id);
-            return Ok(());
-        }
-    };
-
-    // Main data loop - multiplex incoming (client->server) and outgoing (server->client)
-    let mut buf = [0u8; 4096];
-
-    loop {
-        tokio::select! {
-            // Incoming packets from Client (via SSL stream)
-            res = stream.read(&mut buf) => {
-                let n = match res {
-                    Ok(0) => {
-                        info!("DTLS session {} closed (EOF)", addr);
-                        break;
-                    },
-                    Ok(n) => n,
-                    Err(e) => {
-                        warn!("DTLS read error from {}: {}", addr, e);
-                        break;
-                    }
-                };
-
-                // Handle packet based on type (1-byte header)
-                // Note: The OpenSSL stream handles DTLS Record Layer.
-                // The payload here is the application data, which ocserv framing says starts with 1-byte type.
-                let pkt_type = buf[0];
-
-                match pkt_type {
-                    packet_type::DATA => {
-                        // Strip 1-byte header and forward to TUN
-                        let data = Bytes::copy_from_slice(&buf[1..n]);
-                        if tun_tx.send(data).await.is_err() {
-                            warn!("TUN channel closed for session {}", addr);
-                            break;
-                        }
-                    }
-                    packet_type::DPD_REQ => {
-                         let resp = [packet_type::DPD_RESP];
-                        if let Err(e) = stream.write_all(&resp).await {
-                             warn!("Failed to send DPD-RESP to {}: {}", addr, e);
-                        }
-                    }
-                    packet_type::KEEPALIVE => {
-                         let resp = [packet_type::KEEPALIVE];
-                        if let Err(e) = stream.write_all(&resp).await {
-                             warn!("Failed to send KEEPALIVE to {}: {}", addr, e);
-                        }
-                    }
-                    packet_type::DISCONNECT => {
-                        info!("Received DISCONNECT from {}", addr);
-                        break;
-                    }
-                     _ => {
-                        debug!("Unknown packet type 0x{:02x} from {}", pkt_type, addr);
-                    }
-                }
-            }
-
-            // Outgoing packets to Client (from TUN, via channel)
-            outgoing = async {
-                match dtls_out_rx {
-                    Some(ref mut rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            }, if dtls_out_rx.is_some() => {
-                 match outgoing {
-                    Some(data) => {
-                        // Write to DTLS stream (encrypts and wraps in DTLS record)
-                        // Data from VpnTunnel via channel already includes IP Header.
-                        // We need to prepend the 1-byte DATA header (0x00).
-
-                        // Create buffer with header
-                        let mut pkt = Vec::with_capacity(1 + data.len());
-                        pkt.push(packet_type::DATA);
-                        pkt.extend_from_slice(&data);
-
-                        if let Err(e) = stream.write_all(&pkt).await {
-                             warn!("DTLS write error to {}: {}", addr, e);
-                             break;
-                        }
-                    }
-                    None => {
-                        debug!("DTLS outgoing channel closed");
-                        dtls_out_rx = None;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
 }

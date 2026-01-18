@@ -51,7 +51,6 @@ impl HttpServer {
             let cert_path = self.config.server.cert_path.clone();
             let key_path = self.config.server.key_path.clone();
             let dtls_buffer_size = self.config.performance.buffer_size;
-            let dtls_channel_capacity = self.config.performance.channel_capacity;
             info!("Starting DTLS server on UDP port {}", dtls_port);
 
             tokio::spawn(async move {
@@ -61,7 +60,6 @@ impl HttpServer {
                     &cert_path,
                     &key_path,
                     dtls_buffer_size,
-                    dtls_channel_capacity,
                 )
                 .await
                 {
@@ -189,7 +187,6 @@ impl HttpServer {
                                                 psk: psk.to_vec(),
                                                 tun_tx: None,
                                                 dtls_signal_tx: None,
-                                                dtls_out_rx: None,
                                             },
                                         );
 
@@ -247,7 +244,6 @@ impl HttpServer {
                                                     .unwrap_or_default(),
                                                 tun_tx: None,
                                                 dtls_signal_tx: None,
-                                                dtls_out_rx: None,
                                             },
                                         );
                                     }
@@ -366,14 +362,8 @@ impl HttpServer {
 
                                 // Create channel for DTLS packets if DTLS is enabled
                                 let tunnel = if let Some(session_id) = dtls_session_id {
-                                    // Channel for outgoing DTLS packets (TUN -> DTLS task)
-                                    let (out_dtls_tx, out_dtls_rx) = mpsc::channel::<bytes::Bytes>(
-                                        state.config.performance.channel_capacity,
-                                    );
-
-                                    let (dtls_tx, dtls_rx) = mpsc::channel::<bytes::Bytes>(
-                                        state.config.performance.channel_capacity,
-                                    );
+                                    // Channel for DTLS packets if DTLS is enabled
+                                    let (dtls_tx, dtls_rx) = mpsc::channel::<bytes::Bytes>(1024);
                                     // Channel for DTLS readiness signal
                                     let (signal_tx, signal_rx) = mpsc::channel(10);
 
@@ -383,7 +373,6 @@ impl HttpServer {
                                         if let Some(info) = sessions.get_mut(&session_id) {
                                             info.tun_tx = Some(dtls_tx);
                                             info.dtls_signal_tx = Some(signal_tx);
-                                            info.dtls_out_rx = Some(out_dtls_rx);
                                             info!(
                                                 "Linked DTLS session {} to TUN device",
                                                 session_id
@@ -393,22 +382,9 @@ impl HttpServer {
                                         }
                                     }
 
-                                    VpnTunnel::with_dtls(
-                                        tls_stream,
-                                        tun,
-                                        dtls_rx,
-                                        signal_rx,
-                                        out_dtls_tx,
-                                        state.config.performance.buffer_size,
-                                        state.config.performance.channel_capacity,
-                                    )
+                                    VpnTunnel::with_dtls(tls_stream, tun, dtls_rx, signal_rx)
                                 } else {
-                                    VpnTunnel::new(
-                                        tls_stream,
-                                        tun,
-                                        state.config.performance.buffer_size,
-                                        state.config.performance.channel_capacity,
-                                    )
+                                    VpnTunnel::new(tls_stream, tun)
                                 };
 
                                 // Register active tunnel
