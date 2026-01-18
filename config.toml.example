@@ -35,22 +35,28 @@ username = "admin"
 password = "admin"
 
 [[auth.password.users]]
-username = "user1"
-password = "pass1"
+username = "admin"
+password = "admin"
 
-### SAML/SSO Authentication (Phase 4 - Not yet implemented)
+### SAML/SSO Authentication
 [auth.saml]
 enabled = false
+# dev_idp_enabled = true # Use built-in mock IdP for testing
+# idp_metadata_url = "https://vpn.example.com/dev/idp"
+# idp_entity_id = "mock-idp"
+# sp_entity_id = "ocserv-rs-sp"
+# acs_url = "https://vpn.example.com/+CSCOE+/saml/sp/acs"
 
-# Uncomment and configure these when implementing SAML in Phase 4:
-# idp_metadata_url = "https://idp.example.com/metadata"
-# sp_entity_id = "https://vpn.example.com/saml"
-# sp_acs_url = "https://vpn.example.com/saml/acs"
-# base_url = "https://vpn.example.com"
-# sp_cert_path = "sp.crt"
-# sp_key_path = "sp.key"
+### OAuth2 Authentication
+[auth.oauth2]
+enabled = false
+# client_id = "your-client-id"
+# client_secret = "your-client-secret"
+# redirect_uri = "https://vpn.example.com/+CSCOE+/oauth2/callback"
+# auth_url = "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize"
+# token_url = "https://login.microsoftonline.com/organizations/oauth2/v2.0/token"
 
-## Network Configuration (Phase 5)
+## Network Configuration
 [network]
 # CIDR for client IP assignment
 ipv4_pool = "10.10.0.0/24"
@@ -66,3 +72,8 @@ split_include = []
 
 # Tunnel MTU
 mtu = 1280
+
+## Performance Tuning
+[performance]
+buffer_size = 65535
+channel_capacity = 256
