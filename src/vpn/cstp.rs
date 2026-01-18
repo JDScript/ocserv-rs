@@ -81,6 +81,16 @@ impl CstpPacket {
     pub fn encode(&self) -> Bytes {
         let len = self.payload.len();
         let mut buf = BytesMut::with_capacity(CSTP_HEADER_LEN + len);
+        self.encode_into(&mut buf);
+        buf.freeze()
+    }
+
+    /// Encode packet directly into existing buffer (Zero-Copy friendly)
+    pub fn encode_into(&self, buf: &mut BytesMut) {
+        let len = self.payload.len();
+
+        // Ensure capacity
+        buf.reserve(CSTP_HEADER_LEN + len);
 
         // Header
         buf.put_slice(MAGIC);
@@ -89,9 +99,7 @@ impl CstpPacket {
         buf.put_u8(0x00);
 
         // Payload
-        buf.put(self.payload.clone());
-
-        buf.freeze()
+        buf.put_slice(&self.payload);
     }
 
     /// Parse header from exactly 8 bytes
@@ -107,9 +115,18 @@ impl CstpPacket {
         let len = u16::from_be_bytes([header[4], header[5]]) as usize;
         let packet_type = PacketType::from(header[6]);
 
-        // packet type validation could go here
-
         Ok((packet_type, len))
+    }
+
+    /// Write packet directly from slice into buffer (True Zero-Copy)
+    pub fn write_packet(packet_type: PacketType, payload: &[u8], buf: &mut BytesMut) {
+        let len = payload.len();
+        buf.reserve(CSTP_HEADER_LEN + len);
+        buf.put_slice(MAGIC);
+        buf.put_u16(len as u16);
+        buf.put_u8(packet_type.into());
+        buf.put_u8(0x00);
+        buf.put_slice(payload);
     }
 }
 
