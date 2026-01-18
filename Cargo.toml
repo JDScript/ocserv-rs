@@ -86,6 +86,7 @@ assets = [
     ["target/release/occtl", "usr/bin/", "755"],
     ["config.toml.example", "etc/ocserv-rs/config.toml", "644"],
     ["ocserv-rs.service", "lib/systemd/system/", "644"],
+    ["templates/*", "etc/ocserv-rs/templates/", "644"],
 ]
 conf-files = [
     "/etc/ocserv-rs/config.toml"
