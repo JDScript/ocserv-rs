@@ -34,7 +34,7 @@ lazy_static = "1.4"
 
 # SAML support
 samael = "0.0.15"
-openssl = "0.10"
+openssl = { version = "0.10", features = ["vendored"] }
 tokio-openssl = "0.6"
 foreign-types = "0.3"
 
@@ -76,3 +76,18 @@ p256 = { version = "0.13", features = ["ecdh"] }
 hkdf = "0.12"
 sha2 = "0.10"
 aes-gcm = "0.10"
+
+[package.metadata.deb]
+maintainer = "jdscript"
+copyright = "2026, jdscript"
+depends = "$auto"
+assets = [
+    ["target/release/ocserv-rs", "usr/bin/", "755"],
+    ["target/release/occtl", "usr/bin/", "755"],
+    ["config.toml", "etc/ocserv-rs/config.toml", "644"],
+    ["ocserv-rs.service", "lib/systemd/system/", "644"],
+]
+conf-files = [
+    "/etc/ocserv-rs/config.toml"
+]
+systemd-units = { unit-name = "ocserv-rs" }

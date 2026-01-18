@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenConnect VPN Server (Rust)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/etc/ocserv-rs
+ExecStart=/usr/bin/ocserv-rs
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
